@@ -11,7 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/dist/face-api.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#FAF8F3;color:#2C2C2C;font-family:'Lora','Crimson Text',Georgia,serif}
@@ -35,10 +35,25 @@ const Fb="'Lora','Crimson Text',Georgia,serif";
 const Fm="'JetBrains Mono',monospace";
 
 // ── Face-API.js AI Face Recognition ──
-const MODEL_URL="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/model";
+// Models hosted on GitHub via jsdelivr CDN (original face-api.js repo)
+var FACE_MODEL_URL="https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights";
 var faceModelsLoaded=false;
 var faceModelsLoading=false;
 var faceModelError=null;
+var faceApiReady=false;
+
+// Wait for face-api.js script to load (it's defer'd)
+function waitForFaceApi(){
+  if(window.faceapi)return Promise.resolve(true);
+  return new Promise(function(resolve){
+    var attempts=0;
+    var check=setInterval(function(){
+      attempts++;
+      if(window.faceapi){clearInterval(check);resolve(true);return}
+      if(attempts>50){clearInterval(check);console.error("SnapTrace: face-api.js library failed to load from CDN");resolve(false)}
+    },200);
+  });
+}
 
 function loadFaceModels(onProgress){
   if(faceModelsLoaded)return Promise.resolve(true);
@@ -50,53 +65,65 @@ function loadFaceModels(onProgress){
   });
   faceModelsLoading=true;
   faceModelError=null;
-  if(onProgress)onProgress("Loading face detection model...");
-  return faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL).then(function(){
-    if(onProgress)onProgress("Loading face landmark model...");
-    return faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL);
-  }).then(function(){
-    if(onProgress)onProgress("Loading face recognition model...");
-    return faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
-  }).then(function(){
+  if(onProgress)onProgress("Waiting for face-api.js library...");
+  return waitForFaceApi().then(function(libOk){
+    if(!libOk){
+      faceModelError="Library not loaded";
+      faceModelsLoading=false;
+      return false;
+    }
+    console.log("SnapTrace: face-api.js library loaded, version:",faceapi.version||"unknown");
+    if(onProgress)onProgress("Loading face detection model (190KB)...");
+    return faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL);
+  }).then(function(r){
+    if(r===false)return false;
+    console.log("SnapTrace: TinyFaceDetector model loaded");
+    if(onProgress)onProgress("Loading face landmark model (300KB)...");
+    return faceapi.nets.faceLandmark68TinyNet.loadFromUri(FACE_MODEL_URL);
+  }).then(function(r){
+    if(r===false)return false;
+    console.log("SnapTrace: FaceLandmark68Tiny model loaded");
+    if(onProgress)onProgress("Loading face recognition model (6.2MB)...");
+    return faceapi.nets.faceRecognitionNet.loadFromUri(FACE_MODEL_URL);
+  }).then(function(r){
+    if(r===false)return false;
     faceModelsLoaded=true;
     faceModelsLoading=false;
-    console.log("SnapTrace: Face models loaded successfully");
+    console.log("SnapTrace: All face models loaded successfully!");
     return true;
   }).catch(function(err){
     console.error("SnapTrace: Failed to load face models:",err);
-    faceModelError=err;
+    faceModelError=err.message||String(err);
     faceModelsLoading=false;
     return false;
   });
 }
 
-function imgFromUrl(url){
+function loadImage(src){
   return new Promise(function(resolve,reject){
     var img=new Image();
-    img.crossOrigin="anonymous";
-    img.onload=function(){resolve(img)};
-    img.onerror=function(e){reject(new Error("Failed to load image: "+url.substring(0,80)))};
-    img.src=url;
-  });
-}
-
-function imgFromDataUrl(dataUrl){
-  return new Promise(function(resolve,reject){
-    var img=new Image();
-    img.onload=function(){resolve(img)};
-    img.onerror=function(){reject(new Error("Failed to load data URL image"))};
-    img.src=dataUrl;
+    // Only set crossOrigin for http URLs, not data URLs
+    if(src.indexOf("data:")!==0){
+      img.crossOrigin="anonymous";
+    }
+    img.onload=function(){
+      console.log("SnapTrace: Image loaded, size:",img.naturalWidth,"x",img.naturalHeight);
+      resolve(img);
+    };
+    img.onerror=function(){reject(new Error("Image load failed"))};
+    img.src=src;
   });
 }
 
 function detectFacesInImage(imgEl){
-  if(!faceModelsLoaded)return Promise.resolve([]);
-  var opts=new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.3});
+  if(!faceModelsLoaded){console.warn("SnapTrace: Models not loaded, skipping detection");return Promise.resolve([]);}
+  console.log("SnapTrace: Running face detection on",imgEl.naturalWidth,"x",imgEl.naturalHeight,"image...");
+  var opts=new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.2});
   return faceapi.detectAllFaces(imgEl,opts)
     .withFaceLandmarks(true)
     .withFaceDescriptors()
     .then(function(detections){
-      console.log("SnapTrace: Detected "+detections.length+" face(s)");
+      console.log("SnapTrace: Found "+detections.length+" face(s) with descriptors");
       return detections.map(function(d){
         return{
           descriptor:Array.from(d.descriptor),
@@ -105,7 +132,7 @@ function detectFacesInImage(imgEl){
         };
       });
     }).catch(function(err){
-      console.warn("SnapTrace: Face detection failed:",err);
+      console.error("SnapTrace: Face detection error:",err);
       return[];
     });
 }
@@ -383,6 +410,16 @@ function EvtPage({event:ev,events,setEvents,nav,toast}){
   const galleryUrl=`${location.origin}${location.pathname}#gallery/${ev?.qrCode||"demo"}`;
 
   const[modelStatus,setModelStatus]=useState("");
+  const[aiReady,setAiReady]=useState(faceModelsLoaded);
+
+  // Preload face models when event page opens
+  useEffect(function(){
+    if(faceModelsLoaded){setAiReady(true);return}
+    loadFaceModels(function(msg){console.log("SnapTrace preload:",msg)}).then(function(ok){
+      setAiReady(ok);
+      if(ok)console.log("SnapTrace: Models preloaded and ready");
+    });
+  },[]);
 
   function readFileAsDataUrl(file){
     return new Promise(function(resolve,reject){
@@ -402,7 +439,7 @@ function EvtPage({event:ev,events,setEvents,nav,toast}){
       }
       setModelStatus("Detecting faces in photo "+(index+1)+" of "+total+"...");
       setProg(Math.round((index/total)*50+25));
-      return imgFromDataUrl(dataUrl).then(function(img){
+      return loadImage(dataUrl).then(function(img){
         return detectFacesInImage(img);
       }).then(function(faceData){
         setProg(Math.round(((index+1)/total)*90));
@@ -477,7 +514,7 @@ function EvtPage({event:ev,events,setEvents,nav,toast}){
         <div onDragEnter={function(e){e.preventDefault();setDrag(true)}} onDragLeave={function(){setDrag(false)}} onDragOver={function(e){e.preventDefault()}} onDrop={handleDrop} onClick={function(){fRef.current&&fRef.current.click()}} style={{padding:"48px 32px",textAlign:"center",cursor:"pointer"}}>
           <input ref={fRef} type="file" multiple accept="image/*" style={{display:"none"}} onChange={handleFileInput}/>
           {uploading?<div><Spin/><div style={{marginTop:16,fontSize:14,fontWeight:600,marginBottom:8}}>{modelStatus||("Uploading & detecting faces... "+prog+"%")}</div><div style={{width:200,height:4,background:C.creamDk,borderRadius:2,margin:"0 auto",overflow:"hidden"}}><div style={{width:prog+"%",height:"100%",borderRadius:2,background:"linear-gradient(90deg,"+C.gold+","+C.rose+")",transition:"width .1s"}}/></div></div>:
-          <><div style={{color:C.gold,marginBottom:12,opacity:.7}}><Ic.Up/></div><h3 style={{fontFamily:Fh,fontSize:22,marginBottom:6}}>Upload Photos</h3><p style={{color:C.gray,fontSize:14}}>Drag & drop or click to browse</p></>}
+          <><div style={{color:C.gold,marginBottom:12,opacity:.7}}><Ic.Up/></div><h3 style={{fontFamily:Fh,fontSize:22,marginBottom:6}}>Upload Photos</h3><p style={{color:C.gray,fontSize:14}}>Drag & drop or click to browse</p><p style={{fontSize:11,marginTop:8,color:aiReady?C.ok:C.gray,opacity:0.7}}>{aiReady?"AI face detection ready":faceModelError?"AI error: "+faceModelError:"Loading AI models..."}</p></>}
         </div>
       </Crd>
       <h2 style={{fontFamily:Fh,fontSize:24,fontWeight:500,marginBottom:20}}>Photos ({ev.photos.length})</h2>
@@ -553,7 +590,7 @@ function Gallery({event:ev,nav,toast}){
         return;
       }
       setModelMsg("Detecting your face...");
-      return imgFromDataUrl(selfie).then(function(img){
+      return loadImage(selfie).then(function(img){
         return detectFacesInImage(img);
       });
     })
@@ -628,9 +665,7 @@ function Gallery({event:ev,nav,toast}){
           if(cancelRef.current)return;
           setProg(Math.round((i/photos.length)*75));
           setModelMsg("Scanning photo "+(i+1)+" of "+photos.length+" for faces...");
-          // Use imgFromDataUrl for data URLs, imgFromUrl for http URLs
-          var loadFn=photo.url.startsWith("data:")?imgFromDataUrl:imgFromUrl;
-          return loadFn(photo.url).then(function(img){
+          return loadImage(photo.url).then(function(img){
             return detectFacesInImage(img);
           }).then(function(faces){
             if(faces.length>0){
