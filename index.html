@@ -11,6 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/dist/face-api.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#FAF8F3;color:#2C2C2C;font-family:'Lora','Crimson Text',Georgia,serif}
@@ -32,6 +33,87 @@ const C={cream:"#FAF8F3",creamDk:"#F0EDE6",gold:"#D4A574",goldLt:"#E8C9A0",rose:
 const Fh="'Cormorant Garamond','Playfair Display',Georgia,serif";
 const Fb="'Lora','Crimson Text',Georgia,serif";
 const Fm="'JetBrains Mono',monospace";
+
+// ── Face-API.js AI Face Recognition ──
+const MODEL_URL="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/model";
+var faceModelsLoaded=false;
+var faceModelsLoading=false;
+
+async function loadFaceModels(onProgress){
+  if(faceModelsLoaded)return true;
+  if(faceModelsLoading)return new Promise(function(resolve){
+    var check=setInterval(function(){if(faceModelsLoaded){clearInterval(check);resolve(true)}},200);
+  });
+  faceModelsLoading=true;
+  try{
+    if(onProgress)onProgress("Loading face detection model...");
+    await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+    if(onProgress)onProgress("Loading face landmark model...");
+    await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+    if(onProgress)onProgress("Loading face recognition model...");
+    await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+    faceModelsLoaded=true;
+    faceModelsLoading=false;
+    return true;
+  }catch(err){
+    console.error("Failed to load face models:",err);
+    faceModelsLoading=false;
+    return false;
+  }
+}
+
+function imgFromUrl(url){
+  return new Promise(function(resolve,reject){
+    var img=new Image();
+    img.crossOrigin="anonymous";
+    img.onload=function(){resolve(img)};
+    img.onerror=function(){reject(new Error("Failed to load image"))};
+    img.src=url;
+  });
+}
+
+async function detectFacesInImage(imgEl){
+  if(!faceModelsLoaded)return[];
+  try{
+    var detections=await faceapi.detectAllFaces(imgEl).withFaceLandmarks().withFaceDescriptors();
+    return detections.map(function(d){
+      return{
+        descriptor:Array.from(d.descriptor),
+        box:{x:d.detection.box.x,y:d.detection.box.y,w:d.detection.box.width,h:d.detection.box.height},
+        score:d.detection.score
+      };
+    });
+  }catch(err){
+    console.warn("Face detection failed:",err);
+    return[];
+  }
+}
+
+function euclideanDist(a,b){
+  var sum=0;
+  for(var i=0;i<a.length;i++){var d=a[i]-b[i];sum+=d*d}
+  return Math.sqrt(sum);
+}
+
+function matchFaces(selfieDescriptors,photoFaceData,threshold){
+  if(!threshold)threshold=0.55;
+  var results=[];
+  photoFaceData.forEach(function(photo){
+    if(!photo.faceData||photo.faceData.length===0)return;
+    var bestDist=Infinity;
+    selfieDescriptors.forEach(function(sd){
+      photo.faceData.forEach(function(fd){
+        var dist=euclideanDist(sd,fd.descriptor);
+        if(dist<bestDist)bestDist=dist;
+      });
+    });
+    if(bestDist<threshold){
+      results.push({photo:photo,distance:bestDist,confidence:Math.round(Math.max(0,Math.min(100,(1-bestDist/threshold)*100)))});
+    }
+  });
+  results.sort(function(a,b){return a.distance-b.distance});
+  return results;
+}
 
 const PHOTOS=[
 {id:"p1",url:"https://images.unsplash.com/photo-1519741497674-611481863552?w=600&h=400&fit=crop",faces:3},
@@ -279,43 +361,62 @@ function EvtPage({event:ev,events,setEvents,nav,toast}){
   const[uploading,setUploading]=useState(false);const[prog,setProg]=useState(0);const[showQR,setShowQR]=useState(false);const[lb,setLb]=useState(null);const[drag,setDrag]=useState(false);const[copied,setCopied]=useState(false);const fRef=useRef(null);const qrRef=useRef(null);
   const galleryUrl=`${location.origin}${location.pathname}#gallery/${ev?.qrCode||"demo"}`;
 
-  function processFiles(files){
+  const[modelStatus,setModelStatus]=useState("");
+
+  async function processFiles(files){
     if(!files||files.length===0)return;
     var fileList=Array.from(files).filter(function(f){return f.type.startsWith("image/")});
     if(fileList.length===0){toast("Please select image files","error");return}
-    setUploading(true);setProg(0);
-    var loaded=0;var total=fileList.length;var newPhotos=[];
-    fileList.forEach(function(file){
-      var reader=new FileReader();
-      reader.onload=function(e){
-        loaded++;
-        setProg(Math.round(loaded/total*90));
+    setUploading(true);setProg(0);setModelStatus("Loading AI models...");
+
+    var modelsOk=await loadFaceModels(function(msg){setModelStatus(msg)});
+    if(!modelsOk){
+      setModelStatus("");
+      toast("AI models failed to load. Photos will be uploaded without face detection.","error");
+    }
+
+    var total=fileList.length;var newPhotos=[];
+    for(var i=0;i<fileList.length;i++){
+      var file=fileList[i];
+      setModelStatus("Reading photo "+(i+1)+" of "+total+"...");
+      setProg(Math.round((i/total)*50));
+      try{
+        var dataUrl=await new Promise(function(resolve,reject){
+          var reader=new FileReader();
+          reader.onload=function(e){resolve(e.target.result)};
+          reader.onerror=function(){reject(new Error("Read failed"))};
+          reader.readAsDataURL(file);
+        });
+        var faceData=[];
+        if(modelsOk){
+          setModelStatus("Detecting faces in photo "+(i+1)+" of "+total+"...");
+          setProg(Math.round((i/total)*50+25));
+          try{
+            var img=await imgFromUrl(dataUrl);
+            faceData=await detectFacesInImage(img);
+          }catch(err){console.warn("Face detection failed for",file.name,err)}
+        }
         newPhotos.push({
           id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),
-          url:e.target.result,
-          faces:Math.floor(Math.random()*4)+1,
+          url:dataUrl,
+          faces:faceData.length,
+          faceData:faceData,
           name:file.name,
           size:file.size
         });
-        if(loaded===total){
-          setProg(100);
-          setTimeout(function(){
-            setEvents(function(prev){return prev.map(function(evt){
-              if(evt.id===ev.id){return Object.assign({},evt,{photos:evt.photos.concat(newPhotos)})}
-              return evt;
-            })});
-            setUploading(false);setProg(0);
-            var totalFaces=newPhotos.reduce(function(s,p){return s+p.faces},0);
-            toast(loaded+" photo"+(loaded>1?"s":"")+" uploaded, "+totalFaces+" faces detected!","success");
-          },300);
-        }
-      };
-      reader.onerror=function(){
-        loaded++;
-        if(loaded===total){setUploading(false);setProg(0);toast("Some files failed to read","error")}
-      };
-      reader.readAsDataURL(file);
-    });
+      }catch(err){
+        console.warn("Failed to process",file.name,err);
+      }
+      setProg(Math.round(((i+1)/total)*90));
+    }
+    setProg(100);setModelStatus("");
+    setEvents(function(prev){return prev.map(function(evt){
+      if(evt.id===ev.id){return Object.assign({},evt,{photos:evt.photos.concat(newPhotos)})}
+      return evt;
+    })});
+    setUploading(false);setProg(0);
+    var totalFaces=newPhotos.reduce(function(s,p){return s+p.faces},0);
+    toast(newPhotos.length+" photo"+(newPhotos.length>1?"s":"")+" uploaded, "+totalFaces+" face"+(totalFaces!==1?"s":"")+" detected!","success");
   }
 
   function handleFileInput(e){
@@ -342,7 +443,7 @@ function EvtPage({event:ev,events,setEvents,nav,toast}){
       <Crd hover={false} style={{marginBottom:32,padding:0,overflow:"hidden",border:drag?`2px dashed ${C.gold}`:`2px dashed ${C.creamDk}`,background:drag?`${C.gold}05`:C.white}}>
         <div onDragEnter={function(e){e.preventDefault();setDrag(true)}} onDragLeave={function(){setDrag(false)}} onDragOver={function(e){e.preventDefault()}} onDrop={handleDrop} onClick={function(){fRef.current&&fRef.current.click()}} style={{padding:"48px 32px",textAlign:"center",cursor:"pointer"}}>
           <input ref={fRef} type="file" multiple accept="image/*" style={{display:"none"}} onChange={handleFileInput}/>
-          {uploading?<div><Spin/><div style={{marginTop:16,fontSize:14,fontWeight:600,marginBottom:8}}>Uploading & detecting faces... {prog}%</div><div style={{width:200,height:4,background:C.creamDk,borderRadius:2,margin:"0 auto",overflow:"hidden"}}><div style={{width:`${prog}%`,height:"100%",borderRadius:2,background:`linear-gradient(90deg,${C.gold},${C.rose})`,transition:"width .1s"}}/></div></div>:
+          {uploading?<div><Spin/><div style={{marginTop:16,fontSize:14,fontWeight:600,marginBottom:8}}>{modelStatus||("Uploading & detecting faces... "+prog+"%")}</div><div style={{width:200,height:4,background:C.creamDk,borderRadius:2,margin:"0 auto",overflow:"hidden"}}><div style={{width:prog+"%",height:"100%",borderRadius:2,background:"linear-gradient(90deg,"+C.gold+","+C.rose+")",transition:"width .1s"}}/></div></div>:
           <><div style={{color:C.gold,marginBottom:12,opacity:.7}}><Ic.Up/></div><h3 style={{fontFamily:Fh,fontSize:22,marginBottom:6}}>Upload Photos</h3><p style={{color:C.gray,fontSize:14}}>Drag & drop or click to browse</p></>}
         </div>
       </Crd>
@@ -400,30 +501,89 @@ function Gallery({event:ev,nav,toast}){
     r.readAsDataURL(f);
   }
 
+  const[modelMsg,setModelMsg]=useState("");
+  const[matchConfidences,setMatchConfidences]=useState({});
+
   useEffect(function(){
     if(step!=="analyzing"||!selfie)return;
-    // Show analyzing for 2s then start matching
-    var t1=setTimeout(function(){setStep("matching");setProg(0)},2000);
-    return function(){clearTimeout(t1)};
+    var cancelled=false;
+    async function analyze(){
+      setModelMsg("Loading AI face models...");
+      var ok=await loadFaceModels(function(msg){if(!cancelled)setModelMsg(msg)});
+      if(cancelled)return;
+      if(!ok){setModelMsg("AI models failed to load");setTimeout(function(){if(!cancelled){setStep("pick");setSelfie(null)}},2000);return}
+      setModelMsg("Detecting your face...");
+      try{
+        var img=await imgFromUrl(selfie);
+        var faces=await detectFacesInImage(img);
+        if(cancelled)return;
+        if(faces.length===0){setModelMsg("No face detected. Please try a clearer photo.");setTimeout(function(){if(!cancelled){setStep("pick");setSelfie(null)}},2500);return}
+        // Store selfie descriptors for matching step
+        window.__snapSelfieDescriptors=faces.map(function(f){return f.descriptor});
+        window.__snapSelfieFaceCount=faces.length;
+        setModelMsg(faces.length+" face"+(faces.length>1?"s":"")+" detected!");
+        setTimeout(function(){if(!cancelled){setStep("matching");setProg(0)}},1200);
+      }catch(err){
+        console.error("Face analysis error:",err);
+        if(!cancelled){setModelMsg("Face detection failed. Try again.");setTimeout(function(){setStep("pick");setSelfie(null)},2000)}
+      }
+    }
+    analyze();
+    return function(){cancelled=true};
   },[step,selfie]);
 
   useEffect(function(){
     if(step!=="matching")return;
-    var start=Date.now();
-    function tick(){
-      var p=Math.min(100,Math.round((Date.now()-start)/2500*100));
-      setProg(p);
-      if(p<100){requestAnimationFrame(tick)}
-      else{
-        var m=photos.filter(function(){return Math.random()>0.35});
-        if(m.length<2)m=photos.slice(0,Math.min(3,photos.length));
-        setResults(m);setStep("done");
+    var cancelled=false;
+    async function doMatch(){
+      var selfieDescs=window.__snapSelfieDescriptors||[];
+      if(selfieDescs.length===0){setStep("pick");return}
+
+      // Check if photos have face data (real AI descriptors)
+      var photosWithFaceData=photos.filter(function(p){return p.faceData&&p.faceData.length>0});
+
+      if(photosWithFaceData.length===0){
+        // No face data stored - need to scan all photos now
+        setModelMsg("Scanning event photos for faces...");
+        var scannedPhotos=[];
+        for(var i=0;i<photos.length;i++){
+          if(cancelled)return;
+          setProg(Math.round((i/photos.length)*80));
+          setModelMsg("Scanning photo "+(i+1)+" of "+photos.length+"...");
+          try{
+            var img=await imgFromUrl(photos[i].url);
+            var faces=await detectFacesInImage(img);
+            if(faces.length>0){
+              scannedPhotos.push(Object.assign({},photos[i],{faceData:faces,faces:faces.length}));
+            }
+          }catch(err){console.warn("Scan failed for photo",i,err)}
+        }
+        photosWithFaceData=scannedPhotos;
       }
+
+      if(cancelled)return;
+      setProg(85);setModelMsg("Matching your face...");
+
+      var matched=matchFaces(selfieDescs,photosWithFaceData,0.55);
+      if(cancelled)return;
+      setProg(100);
+
+      // Build confidence map
+      var confMap={};
+      var matchedPhotos=matched.map(function(m){confMap[m.photo.id]=m.confidence;return m.photo});
+      setMatchConfidences(confMap);
+
+      setTimeout(function(){
+        if(cancelled)return;
+        if(matchedPhotos.length===0){setModelMsg("No matching photos found. Try a different photo.");setTimeout(function(){if(!cancelled){setStep("pick");setSelfie(null)}},2500);return}
+        setResults(matchedPhotos);setStep("done");setModelMsg("");
+      },400);
     }
-    requestAnimationFrame(tick);
+    doMatch();
+    return function(){cancelled=true};
   },[step]);
 
-  function reset(){setShowFind(false);setStep("pick");setSelfie(null);setResults(null);setProg(0)}
+  function reset(){setShowFind(false);setStep("pick");setSelfie(null);setResults(null);setProg(0);setModelMsg("");setMatchConfidences({})}
 
   var openLb=function(p,i){setLb(p);setLbi(i)};
   var navLb=function(d){var l=results||photos,n=(lbi+d+l.length)%l.length;setLbi(n);setLb(l[n])};
@@ -443,7 +603,7 @@ function Gallery({event:ev,nav,toast}){
         <Crd hover={false} style={{background:"linear-gradient(135deg,"+C.gold+"10,"+C.rose+"10)",border:"1px solid "+C.gold+"30",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12,padding:20}}>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
             <div style={{color:C.gold}}><Ic.Face/></div>
-            <div><span style={{fontWeight:600,fontSize:15}}>Found {results.length} photos of you!</span><br/><span style={{fontSize:12,color:C.gray}}>AI face match complete</span></div>
+            <div><span style={{fontWeight:600,fontSize:15}}>Found {results.length} photos of you!</span><br/><span style={{fontSize:12,color:C.gray}}>AI face recognition match complete</span></div>
           </div>
           <Btn variant="ghost" size="sm" onClick={function(){setResults(null)}}>Show All</Btn>
         </Crd>
@@ -453,7 +613,7 @@ function Gallery({event:ev,nav,toast}){
         {(results||photos).map(function(p,i){
           return <div key={p.id+"_"+i} style={{position:"relative",borderRadius:12,overflow:"hidden",aspectRatio:i%5===0?"1":"4/3",cursor:"pointer",animation:"fu .4s ease-out "+(i*0.04)+"s both"}} onClick={function(){openLb(p,i)}}>
             <img src={p.url} alt="" style={{width:"100%",height:"100%",objectFit:"cover",transition:"transform .5s"}} onMouseEnter={function(e){e.target.style.transform="scale(1.06)"}} onMouseLeave={function(e){e.target.style.transform="scale(1)"}}/>
-            {results&&<div style={{position:"absolute",top:8,right:8,background:C.gold,color:"#fff",borderRadius:8,padding:"3px 8px",fontSize:10,fontWeight:700}}>{(80+Math.floor(Math.random()*19))}%</div>}
+            {results&&<div style={{position:"absolute",top:8,right:8,background:C.gold,color:"#fff",borderRadius:8,padding:"3px 8px",fontSize:10,fontWeight:700}}>{matchConfidences[p.id]||"--"}%</div>}
           </div>;
         })}
       </div>
@@ -483,12 +643,12 @@ function Gallery({event:ev,nav,toast}){
       {step==="analyzing"&&selfie&&<div style={{textAlign:"center",padding:"10px 0"}}>
         <div style={{width:200,height:200,borderRadius:20,overflow:"hidden",margin:"0 auto 16px",position:"relative",border:"3px solid "+C.gold}}>
           <img src={selfie} alt="" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
-          <div style={{position:"absolute",left:"20%",top:"10%",width:"60%",height:"70%",border:"2px solid "+C.gold,borderRadius:8,animation:"si .6s ease-out"}}>
+          {window.__snapSelfieFaceCount>0&&<div style={{position:"absolute",left:"20%",top:"10%",width:"60%",height:"70%",border:"2px solid "+C.gold,borderRadius:8,animation:"si .6s ease-out"}}>
             <span style={{position:"absolute",top:-18,left:0,background:C.gold,color:"#fff",fontSize:10,padding:"2px 8px",borderRadius:4,fontWeight:700}}>Face detected</span>
-          </div>
+          </div>}
         </div>
-        <p style={{color:C.ok,fontSize:15,fontWeight:600}}>1 face detected</p>
-        <p style={{color:C.gray,fontSize:13,marginTop:4}}>Preparing to scan photos...</p>
+        <Spin size={24}/>
+        <p style={{color:C.gold,fontSize:14,fontWeight:600,marginTop:12}}>{modelMsg||"Analyzing..."}</p>
       </div>}
 
       {step==="matching"&&<div style={{textAlign:"center",padding:"10px 0"}}>
@@ -499,8 +659,8 @@ function Gallery({event:ev,nav,toast}){
             {photos.slice(0,4).map(function(p,i){return <img key={i} src={p.url} alt="" style={{width:"100%",height:"100%",objectFit:"cover"}}/>})}
           </div>
         </div>
-        <h3 style={{fontFamily:Fh,fontSize:22,marginBottom:6}}>Matching Your Face</h3>
-        <p style={{color:C.gray,fontSize:14}}>Scanning {photos.length} photos...</p>
+        <h3 style={{fontFamily:Fh,fontSize:22,marginBottom:6}}>AI Face Matching</h3>
+        <p style={{color:C.gray,fontSize:14}}>{modelMsg||("Scanning "+photos.length+" photos...")}</p>
         <div style={{fontSize:32,fontFamily:Fh,fontWeight:700,color:C.gold,margin:"12px 0"}}>{prog}%</div>
         <div style={{width:220,height:6,background:C.creamDk,borderRadius:3,margin:"0 auto",overflow:"hidden"}}>
           <div style={{width:prog+"%",height:"100%",borderRadius:3,background:"linear-gradient(90deg,"+C.gold+","+C.rose+")",transition:"width .1s"}}/>
@@ -510,7 +670,8 @@ function Gallery({event:ev,nav,toast}){
       {step==="done"&&results&&<div style={{textAlign:"center",padding:"10px 0"}}>
         <div style={{fontSize:48,marginBottom:12}}>🎉</div>
         <h3 style={{fontFamily:Fh,fontSize:26,marginBottom:4}}>Found {results.length} Photos!</h3>
-        <p style={{color:C.gray,fontSize:14,marginBottom:16}}>You appear in {results.length} of {photos.length} photos</p>
+        <p style={{color:C.gray,fontSize:14,marginBottom:4}}>AI matched your face in {results.length} of {photos.length} photos</p>
+        {results.length>0&&<p style={{color:C.ok,fontSize:12,marginBottom:16}}>Best match: {Math.max.apply(null,Object.values(matchConfidences).concat([0]))}% confidence</p>}
         <div style={{display:"flex",gap:5,justifyContent:"center",marginBottom:20,flexWrap:"wrap"}}>
           {results.slice(0,6).map(function(p,i){return <div key={i} style={{width:44,height:44,borderRadius:8,overflow:"hidden",border:"2px solid "+C.gold}}><img src={p.url} alt="" style={{width:"100%",height:"100%",objectFit:"cover"}}/></div>})}
           {results.length>6&&<div style={{width:44,height:44,borderRadius:8,background:C.creamDk,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:600,color:C.gray}}>+{results.length-6}</div>}
@@ -540,11 +701,18 @@ function Gallery({event:ev,nav,toast}){
 function saveEvents(events){
   try{
     // Store event metadata separately from photo data to handle large photos
-    var meta=events.map(function(e){return Object.assign({},e,{photoCount:e.photos.length})});
+    var meta=events.map(function(e){return Object.assign({},e,{photoCount:e.photos.length,photos:[]})});
     localStorage.setItem("st_events",JSON.stringify(meta));
-    // Store photos per event
+    // Store photos per event (including face descriptor data for AI matching)
     events.forEach(function(e){
-      try{localStorage.setItem("st_photos_"+e.id,JSON.stringify(e.photos))}catch(err){console.warn("Storage full for event "+e.id)}
+      try{localStorage.setItem("st_photos_"+e.id,JSON.stringify(e.photos))}catch(err){
+        // If storage is full, try saving without face data as fallback
+        try{
+          var slimPhotos=e.photos.map(function(p){return Object.assign({},p,{faceData:undefined})});
+          localStorage.setItem("st_photos_"+e.id,JSON.stringify(slimPhotos));
+          console.warn("Storage full for event "+e.id+", saved without face descriptors");
+        }catch(err2){console.warn("Storage full for event "+e.id)}
+      }
     });
   }catch(e){console.warn("localStorage save error:",e)}
 }
