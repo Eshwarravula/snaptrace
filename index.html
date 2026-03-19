@@ -137,6 +137,92 @@ function detectFacesInImage(imgEl){
     });
 }
 
+// ── Image Compression ──
+// Compress images before storage to prevent localStorage/IndexedDB bloat
+function compressImage(dataUrl, maxDim, quality){
+  if(!maxDim)maxDim=1200;
+  if(!quality)quality=0.75;
+  return new Promise(function(resolve){
+    var img=new Image();
+    img.onload=function(){
+      var w=img.naturalWidth, h=img.naturalHeight;
+      // Skip compression for already-small images
+      if(w<=maxDim&&h<=maxDim&&dataUrl.length<200000){resolve(dataUrl);return}
+      var scale=Math.min(maxDim/w, maxDim/h, 1);
+      var nw=Math.round(w*scale), nh=Math.round(h*scale);
+      var canvas=document.createElement("canvas");
+      canvas.width=nw; canvas.height=nh;
+      var ctx=canvas.getContext("2d");
+      ctx.drawImage(img,0,0,nw,nh);
+      var compressed=canvas.toDataURL("image/jpeg",quality);
+      console.log("SnapTrace: Compressed "+w+"x"+h+" → "+nw+"x"+nh+" ("+Math.round(dataUrl.length/1024)+"KB → "+Math.round(compressed.length/1024)+"KB)");
+      resolve(compressed);
+    };
+    img.onerror=function(){resolve(dataUrl)};
+    img.src=dataUrl;
+  });
+}
+
+// ── IndexedDB Photo Storage ──
+// localStorage has 5-10MB limit; IndexedDB has 50MB+ and handles binary data well
+var SNAP_DB_NAME="snaptrace_photos";
+var SNAP_DB_VERSION=1;
+
+function openSnapDB(){
+  return new Promise(function(resolve,reject){
+    if(!window.indexedDB){reject(new Error("IndexedDB not supported"));return}
+    var req=indexedDB.open(SNAP_DB_NAME,SNAP_DB_VERSION);
+    req.onupgradeneeded=function(e){
+      var db=e.target.result;
+      if(!db.objectStoreNames.contains("photos")){
+        db.createObjectStore("photos");
+      }
+    };
+    req.onsuccess=function(e){resolve(e.target.result)};
+    req.onerror=function(){reject(req.error)};
+  });
+}
+
+function idbSavePhotos(eventId, photos){
+  return openSnapDB().then(function(db){
+    return new Promise(function(resolve,reject){
+      var tx=db.transaction("photos","readwrite");
+      tx.objectStore("photos").put(photos,"evt_"+eventId);
+      tx.oncomplete=function(){resolve(true)};
+      tx.onerror=function(){reject(tx.error)};
+    });
+  }).catch(function(err){
+    console.warn("SnapTrace: IndexedDB save failed, falling back to localStorage:",err);
+    try{localStorage.setItem("st_photos_"+eventId,JSON.stringify(photos))}catch(e){}
+    return false;
+  });
+}
+
+function idbLoadPhotos(eventId){
+  return openSnapDB().then(function(db){
+    return new Promise(function(resolve,reject){
+      var tx=db.transaction("photos","readonly");
+      var req=tx.objectStore("photos").get("evt_"+eventId);
+      req.onsuccess=function(){resolve(req.result||null)};
+      req.onerror=function(){reject(req.error)};
+    });
+  }).catch(function(err){
+    console.warn("SnapTrace: IndexedDB load failed:",err);
+    return null;
+  });
+}
+
+function idbDeletePhotos(eventId){
+  return openSnapDB().then(function(db){
+    return new Promise(function(resolve){
+      var tx=db.transaction("photos","readwrite");
+      tx.objectStore("photos").delete("evt_"+eventId);
+      tx.oncomplete=function(){resolve()};
+      tx.onerror=function(){resolve()};
+    });
+  }).catch(function(){});
+}
+
 function euclideanDist(a,b){
   var sum=0;
   for(var i=0;i<a.length;i++){var d=a[i]-b[i];sum+=d*d}
@@ -434,19 +520,22 @@ function EvtPage({event:ev,events,setEvents,nav,toast}){
     setModelStatus("Reading photo "+(index+1)+" of "+total+"...");
     setProg(Math.round((index/total)*50));
     return readFileAsDataUrl(file).then(function(dataUrl){
+      // Compress image to prevent storage overflow (max 1200px, 75% JPEG quality)
+      return compressImage(dataUrl,1200,0.75);
+    }).then(function(compressedUrl){
       if(!modelsOk){
-        return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:dataUrl,faces:0,faceData:[],name:file.name,size:file.size};
+        return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:compressedUrl,faces:0,faceData:[],name:file.name,size:file.size};
       }
       setModelStatus("Detecting faces in photo "+(index+1)+" of "+total+"...");
       setProg(Math.round((index/total)*50+25));
-      return loadImage(dataUrl).then(function(img){
+      return loadImage(compressedUrl).then(function(img){
         return detectFacesInImage(img);
       }).then(function(faceData){
         setProg(Math.round(((index+1)/total)*90));
-        return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:dataUrl,faces:faceData.length,faceData:faceData,name:file.name,size:file.size};
+        return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:compressedUrl,faces:faceData.length,faceData:faceData,name:file.name,size:file.size};
       }).catch(function(err){
         console.warn("SnapTrace: Face detection failed for",file.name,err);
-        return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:dataUrl,faces:0,faceData:[],name:file.name,size:file.size};
+        return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:compressedUrl,faces:0,faceData:[],name:file.name,size:file.size};
       });
     });
   }
@@ -560,7 +649,48 @@ function Gallery({event:ev,nav,toast}){
   const camRef=useRef(null);
   const upRef=useRef(null);
 
-  var photos=ev?ev.photos:PHOTOS;
+  // Live-refresh: poll IndexedDB/localStorage every 3s so guests see new uploads
+  const[livePhotos,setLivePhotos]=useState(ev?ev.photos:[]);
+  useEffect(function(){
+    if(!ev)return;
+    // Initialize with current event photos
+    if(ev.photos&&ev.photos.length>0){setLivePhotos(ev.photos)}
+    function refresh(){
+      // Try IndexedDB first (handles large photos), then localStorage
+      idbLoadPhotos(ev.id).then(function(idbPhotos){
+        if(idbPhotos&&idbPhotos.length>0){
+          setLivePhotos(idbPhotos);
+          return;
+        }
+        // Fallback to localStorage
+        try{
+          var fresh=loadEvents();
+          var freshEv=fresh.find(function(e){return e.id===ev.id||e.qrCode===ev.qrCode});
+          if(freshEv&&freshEv.photos&&freshEv.photos.length>0){
+            setLivePhotos(freshEv.photos);
+          }
+        }catch(e){}
+      }).catch(function(){
+        try{
+          var fresh=loadEvents();
+          var freshEv=fresh.find(function(e){return e.id===ev.id||e.qrCode===ev.qrCode});
+          if(freshEv&&freshEv.photos&&freshEv.photos.length>0){
+            setLivePhotos(freshEv.photos);
+          }
+        }catch(e){}
+      });
+    }
+    // Also do an initial async load from IndexedDB (may have more photos than localStorage)
+    refresh();
+    // Poll every 3s for same-tab updates
+    var timer=setInterval(refresh,3000);
+    // Instant cross-tab sync via storage event
+    function onStorage(e){if(e.key==="st_events")refresh()}
+    window.addEventListener("storage",onStorage);
+    return function(){clearInterval(timer);window.removeEventListener("storage",onStorage)};
+  },[ev]);
+
+  var photos=livePhotos.length>0?livePhotos:(ev?ev.photos:PHOTOS);
   var eName=ev?ev.name:"Priya & Arjun's Wedding";
 
   function onFile(e){
@@ -806,23 +936,19 @@ function Gallery({event:ev,nav,toast}){
 // ── STORAGE HELPERS ──
 function saveEvents(events){
   try{
-    // Store event metadata separately from photo data to handle large photos
+    // Store event metadata (without photos) in localStorage
     var meta=events.map(function(e){return Object.assign({},e,{photoCount:e.photos.length,photos:[]})});
     localStorage.setItem("st_events",JSON.stringify(meta));
-    // Store photos per event (including face descriptor data for AI matching)
+    // Store photos in IndexedDB (large capacity), with localStorage fallback
     events.forEach(function(e){
-      try{localStorage.setItem("st_photos_"+e.id,JSON.stringify(e.photos))}catch(err){
-        // If storage is full, try saving without face data as fallback
-        try{
-          var slimPhotos=e.photos.map(function(p){return Object.assign({},p,{faceData:undefined})});
-          localStorage.setItem("st_photos_"+e.id,JSON.stringify(slimPhotos));
-          console.warn("Storage full for event "+e.id+", saved without face descriptors");
-        }catch(err2){console.warn("Storage full for event "+e.id)}
-      }
+      idbSavePhotos(e.id,e.photos).catch(function(){});
+      // Also try localStorage as backup (will silently fail if quota exceeded)
+      try{localStorage.setItem("st_photos_"+e.id,JSON.stringify(e.photos))}catch(err){}
     });
   }catch(e){console.warn("localStorage save error:",e)}
 }
 
+// Synchronous load for initial state (uses localStorage, then async-patches from IndexedDB)
 function loadEvents(){
   try{
     var raw=localStorage.getItem("st_events");
@@ -834,6 +960,28 @@ function loadEvents(){
       return Object.assign({},e,{photos:photos});
     });
   }catch(e){return[]}
+}
+
+// Async load that checks IndexedDB for photos (more reliable for large data)
+function loadEventsAsync(){
+  var meta;
+  try{
+    var raw=localStorage.getItem("st_events");
+    if(!raw)return Promise.resolve([]);
+    meta=JSON.parse(raw);
+  }catch(e){return Promise.resolve([])}
+  var promises=meta.map(function(e){
+    return idbLoadPhotos(e.id).then(function(idbPhotos){
+      if(idbPhotos&&idbPhotos.length>0){
+        return Object.assign({},e,{photos:idbPhotos});
+      }
+      // Fallback to localStorage
+      var photosRaw=localStorage.getItem("st_photos_"+e.id);
+      var photos=photosRaw?JSON.parse(photosRaw):(e.photos||[]);
+      return Object.assign({},e,{photos:photos});
+    });
+  });
+  return Promise.all(promises);
 }
 
 function saveUser(user){
@@ -853,10 +1001,30 @@ function App(){
   const[aQr,setAQr]=useState(null);
   const[t,setT]=useState(null);
 
-  // Persist events to localStorage whenever they change
+  // Persist events to localStorage + IndexedDB whenever they change
   useEffect(function(){saveEvents(events)},[events]);
   // Persist user
   useEffect(function(){saveUser(user)},[user]);
+
+  // On mount, async-load photos from IndexedDB (more reliable than localStorage for large photos)
+  useEffect(function(){
+    loadEventsAsync().then(function(fullEvents){
+      if(!fullEvents||fullEvents.length===0)return;
+      // Only update if IndexedDB has more photos than current state
+      setEvents(function(prev){
+        var changed=false;
+        var merged=prev.map(function(evt){
+          var idbEvt=fullEvents.find(function(e){return e.id===evt.id});
+          if(idbEvt&&idbEvt.photos&&idbEvt.photos.length>evt.photos.length){
+            changed=true;
+            return Object.assign({},evt,{photos:idbEvt.photos});
+          }
+          return evt;
+        });
+        return changed?merged:prev;
+      });
+    });
+  },[]);
 
   // Auto-login if user exists in storage
   useEffect(function(){if(user&&page==="landing")setPage("dashboard")},[]);
