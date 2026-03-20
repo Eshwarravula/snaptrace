@@ -211,7 +211,7 @@ function detectFacesInImage(imgEl){
 
   function tryDetect(sizeIdx){
     var size=sizes[sizeIdx]||416;
-    var opts=new faceapi.TinyFaceDetectorOptions({inputSize:size,scoreThreshold:0.3});
+    var opts=new faceapi.TinyFaceDetectorOptions({inputSize:size,scoreThreshold:0.15});
     return faceapi.detectAllFaces(imgEl,opts)
       .withFaceLandmarks(useTiny)
       .withFaceDescriptors()
@@ -330,7 +330,7 @@ function euclideanDist(a,b){
 }
 
 function matchFaces(selfieDescriptors,photoFaceData,threshold){
-  if(!threshold)threshold=0.5;
+  if(!threshold)threshold=0.6;
   var results=[];
   photoFaceData.forEach(function(photo){
     if(!photo.faceData||photo.faceData.length===0)return;
@@ -889,8 +889,8 @@ function Gallery({event:ev,nav,toast}){
       setProg(85);setModelMsg("Matching your face against "+photosToMatch.length+" photos...");
 
       // Two-pass matching: strict first (high confidence), then relaxed (catch more)
-      var strictMatched=matchFaces(selfieDescs,photosToMatch,0.45);
-      var relaxedMatched=matchFaces(selfieDescs,photosToMatch,0.55);
+      var strictMatched=matchFaces(selfieDescs,photosToMatch,0.5);
+      var relaxedMatched=matchFaces(selfieDescs,photosToMatch,0.62);
 
       // Combine: strict matches always included, relaxed only if not duplicates
       var matchedMap={};
