@@ -11,7 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/dist/face-api.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#FAF8F3;color:#2C2C2C;font-family:'Lora','Crimson Text',Georgia,serif}
@@ -35,8 +35,11 @@ const Fb="'Lora','Crimson Text',Georgia,serif";
 const Fm="'JetBrains Mono',monospace";
 
 // ── Face-API.js AI Face Recognition ──
-// Models hosted on GitHub via jsdelivr CDN (original face-api.js repo)
-var FACE_MODEL_URL="https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights";
+// Using @vladmandic/face-api (maintained fork) with models from jsdelivr CDN
+var FACE_MODEL_URLS=[
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.14/model",
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model"
+];
 var faceModelsLoaded=false;
 var faceModelsLoading=false;
 var faceModelError=null;
@@ -50,8 +53,25 @@ function waitForFaceApi(){
     var check=setInterval(function(){
       attempts++;
       if(window.faceapi){clearInterval(check);resolve(true);return}
-      if(attempts>50){clearInterval(check);console.error("SnapTrace: face-api.js library failed to load from CDN");resolve(false)}
+      if(attempts>100){clearInterval(check);console.error("SnapTrace: face-api.js library failed to load from CDN");resolve(false)}
     },200);
+  });
+}
+
+function tryLoadModels(modelUrl,onProgress){
+  console.log("SnapTrace: Trying model URL:",modelUrl);
+  if(onProgress)onProgress("Loading face detection model...");
+  return faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl).then(function(){
+    console.log("SnapTrace: TinyFaceDetector model loaded from",modelUrl);
+    if(onProgress)onProgress("Loading face landmark model...");
+    return faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl);
+  }).then(function(){
+    console.log("SnapTrace: FaceLandmark68Net model loaded");
+    if(onProgress)onProgress("Loading face recognition model (6MB)...");
+    return faceapi.nets.faceRecognitionNet.loadFromUri(modelUrl);
+  }).then(function(){
+    console.log("SnapTrace: FaceRecognitionNet model loaded from",modelUrl);
+    return true;
   });
 }
 
@@ -73,26 +93,23 @@ function loadFaceModels(onProgress){
       return false;
     }
     console.log("SnapTrace: face-api.js library loaded, version:",faceapi.version||"unknown");
-    if(onProgress)onProgress("Loading face detection model (190KB)...");
-    return faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL);
-  }).then(function(r){
-    if(r===false)return false;
-    console.log("SnapTrace: TinyFaceDetector model loaded");
-    if(onProgress)onProgress("Loading face landmark model (300KB)...");
-    return faceapi.nets.faceLandmark68TinyNet.loadFromUri(FACE_MODEL_URL);
-  }).then(function(r){
-    if(r===false)return false;
-    console.log("SnapTrace: FaceLandmark68Tiny model loaded");
-    if(onProgress)onProgress("Loading face recognition model (6.2MB)...");
-    return faceapi.nets.faceRecognitionNet.loadFromUri(FACE_MODEL_URL);
-  }).then(function(r){
-    if(r===false)return false;
+    // Try each CDN URL until one works
+    var chain=Promise.reject(new Error("No model URLs"));
+    FACE_MODEL_URLS.forEach(function(url){
+      chain=chain.catch(function(){
+        return tryLoadModels(url,onProgress);
+      });
+    });
+    return chain;
+  }).then(function(ok){
+    if(ok===false)return false;
     faceModelsLoaded=true;
     faceModelsLoading=false;
     console.log("SnapTrace: All face models loaded successfully!");
+    if(onProgress)onProgress("AI models ready!");
     return true;
   }).catch(function(err){
-    console.error("SnapTrace: Failed to load face models:",err);
+    console.error("SnapTrace: Failed to load face models from all CDNs:",err);
     faceModelError=err.message||String(err);
     faceModelsLoading=false;
     return false;
@@ -118,9 +135,9 @@ function loadImage(src){
 function detectFacesInImage(imgEl){
   if(!faceModelsLoaded){console.warn("SnapTrace: Models not loaded, skipping detection");return Promise.resolve([]);}
   console.log("SnapTrace: Running face detection on",imgEl.naturalWidth,"x",imgEl.naturalHeight,"image...");
-  var opts=new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.2});
+  var opts=new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.15});
   return faceapi.detectAllFaces(imgEl,opts)
-    .withFaceLandmarks(true)
+    .withFaceLandmarks()
     .withFaceDescriptors()
     .then(function(detections){
       console.log("SnapTrace: Found "+detections.length+" face(s) with descriptors");
