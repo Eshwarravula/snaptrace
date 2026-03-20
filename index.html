@@ -11,23 +11,22 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
-<!-- face-api.js: try multiple CDN sources for reliability -->
+<!-- face-api.js: local file first, CDN fallback -->
 <script>
 (function(){
   var urls=[
+    "face-api.js",
     "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js",
-    "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js",
-    "https://unpkg.com/@vladmandic/face-api@1.7.15/dist/face-api.js",
-    "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"
+    "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"
   ];
   var idx=0;
   function tryLoad(){
-    if(idx>=urls.length){console.error("SnapTrace: All face-api.js CDN sources failed");return}
+    if(idx>=urls.length){console.error("SnapTrace: All face-api.js sources failed");return}
     var s=document.createElement("script");
     s.src=urls[idx];
-    s.onload=function(){console.log("SnapTrace: face-api.js loaded from",urls[idx])};
+    s.onload=function(){console.log("SnapTrace: face-api.js loaded from "+urls[idx])};
     s.onerror=function(){
-      console.warn("SnapTrace: Failed to load from",urls[idx]);
+      console.warn("SnapTrace: Failed to load from "+urls[idx]);
       idx++;tryLoad();
     };
     document.head.appendChild(s);
@@ -60,11 +59,9 @@ const Fm="'JetBrains Mono',monospace";
 // ── Face-API.js AI Face Recognition ──
 // Multiple CDN fallbacks for maximum reliability
 var FACE_MODEL_URLS=[
+  "models",
   "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model",
-  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model",
-  "https://unpkg.com/@vladmandic/face-api@1.7.15/model",
-  "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights",
-  "https://cdn.jsdelivr.net/gh/cgarciagl/face-api.js/weights"
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model"
 ];
 var faceModelsLoaded=false;
 var faceModelsLoading=false;
