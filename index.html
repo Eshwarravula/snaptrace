@@ -331,28 +331,30 @@ function euclideanDist(a,b){
 
 function matchFaces(selfieDescriptors,photoFaceData,threshold){
   if(!threshold)threshold=0.6;
+  console.log("SnapTrace matchFaces: selfieDescs="+selfieDescriptors.length+", photos="+photoFaceData.length+", threshold="+threshold);
   var results=[];
-  photoFaceData.forEach(function(photo){
+  photoFaceData.forEach(function(photo,pi){
     if(!photo.faceData||photo.faceData.length===0)return;
-    // Find best match across all selfie faces and all photo faces
     var bestDist=Infinity;
-    var allDists=[];
     selfieDescriptors.forEach(function(sd){
+      if(!sd||!Array.isArray(sd)||sd.length===0)return;
       photo.faceData.forEach(function(fd){
+        if(!fd||!fd.descriptor||!Array.isArray(fd.descriptor)||fd.descriptor.length===0)return;
         var dist=euclideanDist(sd,fd.descriptor);
-        allDists.push(dist);
         if(dist<bestDist)bestDist=dist;
       });
     });
+    if(bestDist<2){  // Log all reasonable distances for debugging
+      console.log("SnapTrace: Photo "+(photo.name||photo.id)+" best distance: "+bestDist.toFixed(3)+(bestDist<threshold?" ✓ MATCH":""));
+    }
     if(bestDist<threshold){
-      // Confidence: 0.0 distance = 100%, threshold distance = 0%
-      // Use exponential curve for more intuitive confidence display
-      var rawConf=1.0-bestDist/0.8; // 0.8 is the max meaningful distance
+      var rawConf=1.0-bestDist/0.8;
       var confidence=Math.round(Math.max(5,Math.min(99,rawConf*100)));
       results.push({photo:photo,distance:bestDist,confidence:confidence});
     }
   });
   results.sort(function(a,b){return a.distance-b.distance});
+  console.log("SnapTrace matchFaces: "+results.length+" matches found");
   return results;
 }
 
@@ -881,6 +883,27 @@ function Gallery({event:ev,nav,toast}){
     var selfieDescs=window.__snapSelfieDescriptors||[];
     if(selfieDescs.length===0){setStep("pick");return}
 
+    // Ensure photos are loaded from IndexedDB (async) before matching
+    // photos from state might not have faceData yet if loaded from localStorage fallback
+    function getPhotosWithFaceData(){
+      var current=photos.filter(function(p){return p.faceData&&p.faceData.length>0});
+      if(current.length>0)return Promise.resolve(current);
+      // Try loading from IndexedDB directly (might have faceData that localStorage dropped)
+      if(ev&&ev.id){
+        return idbLoadPhotos(ev.id).then(function(idbPhotos){
+          if(idbPhotos&&idbPhotos.length>0){
+            var withFace=idbPhotos.filter(function(p){return p.faceData&&p.faceData.length>0});
+            if(withFace.length>0){
+              console.log("SnapTrace: Loaded "+withFace.length+" photos with faceData from IndexedDB");
+              return withFace;
+            }
+          }
+          return photos; // Fallback to all photos (will scan on the fly)
+        }).catch(function(){return photos});
+      }
+      return Promise.resolve(photos);
+    }
+
     // Check if photos already have face descriptor data
     var photosWithFaceData=photos.filter(function(p){return p.faceData&&p.faceData.length>0});
 
@@ -917,21 +940,30 @@ function Gallery({event:ev,nav,toast}){
       },500);
     }
 
-    if(photosWithFaceData.length>0){
-      // Photos already have face data from upload - match directly
-      setModelMsg("Matching against "+photosWithFaceData.length+" photos with face data...");
-      setProg(50);
-      finishMatching(photosWithFaceData);
-    }else{
+    setModelMsg("Loading photos for matching...");
+    getPhotosWithFaceData().then(function(resolvedPhotos){
+      if(cancelRef.current)return;
+      var withFace=resolvedPhotos.filter(function(p){return p.faceData&&p.faceData.length>0});
+      console.log("SnapTrace: Matching - total photos:",resolvedPhotos.length,", with faceData:",withFace.length);
+
+      if(withFace.length>0){
+        // Photos already have face data from upload - match directly
+        setModelMsg("Matching against "+withFace.length+" photos with face data...");
+        setProg(50);
+        finishMatching(withFace);
+        return;
+      }
+
       // No pre-computed face data - scan photos on the fly
-      setModelMsg("Scanning event photos for faces...");
+      var allPhotos=resolvedPhotos.length>0?resolvedPhotos:photos;
+      setModelMsg("Scanning "+allPhotos.length+" event photos for faces...");
       var scannedResults=[];
       var scanChain=Promise.resolve();
-      photos.forEach(function(photo,i){
+      allPhotos.forEach(function(photo,i){
         scanChain=scanChain.then(function(){
           if(cancelRef.current)return;
-          setProg(Math.round((i/photos.length)*75));
-          setModelMsg("Scanning photo "+(i+1)+" of "+photos.length+" for faces...");
+          setProg(Math.round((i/allPhotos.length)*75));
+          setModelMsg("Scanning photo "+(i+1)+" of "+allPhotos.length+" for faces...");
           return loadImage(photo.url).then(function(img){
             return detectFacesInImage(img);
           }).then(function(faces){
@@ -945,7 +977,7 @@ function Gallery({event:ev,nav,toast}){
       });
       scanChain.then(function(){
         if(cancelRef.current)return;
-        console.log("SnapTrace: Scanned "+photos.length+" photos, found faces in "+scannedResults.length);
+        console.log("SnapTrace: Scanned "+allPhotos.length+" photos, found faces in "+scannedResults.length);
         finishMatching(scannedResults);
       }).catch(function(err){
         console.error("SnapTrace: Matching error:",err);
@@ -954,7 +986,7 @@ function Gallery({event:ev,nav,toast}){
           setTimeout(function(){setStep("pick");setSelfie(null)},3000);
         }
       });
-    }
+    });
 
     return function(){cancelRef.current=true};
   },[step]);
@@ -1076,11 +1108,24 @@ function saveEvents(events){
     // Store event metadata (without photos) in localStorage
     var meta=events.map(function(e){return Object.assign({},e,{photoCount:e.photos.length,photos:[]})});
     localStorage.setItem("st_events",JSON.stringify(meta));
-    // Store photos in IndexedDB (large capacity), with localStorage fallback
+    // Store full photos (with faceData) in IndexedDB (large capacity) — PRIMARY storage
     events.forEach(function(e){
       idbSavePhotos(e.id,e.photos).catch(function(){});
-      // Also try localStorage as backup (will silently fail if quota exceeded)
-      try{localStorage.setItem("st_photos_"+e.id,JSON.stringify(e.photos))}catch(err){}
+      // localStorage backup: try full data, fallback to stripped if quota exceeded
+      try{
+        localStorage.setItem("st_photos_"+e.id,JSON.stringify(e.photos));
+      }catch(err){
+        // Photos too large for localStorage — save without image data URLs
+        // IndexedDB has the full copy; this is just a fallback for metadata
+        try{
+          var lightPhotos=e.photos.map(function(p){
+            return{id:p.id,url:"",faces:p.faces,faceData:p.faceData,name:p.name,size:p.size};
+          });
+          localStorage.setItem("st_photos_"+e.id,JSON.stringify(lightPhotos));
+        }catch(err2){
+          console.warn("SnapTrace: localStorage photo save failed for event",e.id);
+        }
+      }
     });
   }catch(e){console.warn("localStorage save error:",e)}
 }
