@@ -70,12 +70,22 @@ var faceModelLoadAttempts=0;
 
 // Wait for face-api.js script to load (dynamically loaded with fallbacks)
 function waitForFaceApi(){
-  if(window.faceapi)return Promise.resolve(true);
+  if(window.faceapi&&window.faceapi.nets&&window.faceapi.detectAllFaces)return Promise.resolve(true);
   return new Promise(function(resolve){
     var attempts=0;
     var check=setInterval(function(){
       attempts++;
-      if(window.faceapi){clearInterval(check);console.log("SnapTrace: faceapi global found after",attempts*300,"ms");resolve(true);return}
+      if(window.faceapi){
+        // Verify the library has the required API surface
+        if(window.faceapi.nets&&window.faceapi.detectAllFaces){
+          clearInterval(check);
+          console.log("SnapTrace: faceapi global found after",attempts*300,"ms, nets:",
+            Object.keys(window.faceapi.nets||{}).join(","));
+          resolve(true);
+          return;
+        }
+        console.log("SnapTrace: faceapi found but incomplete, waiting...");
+      }
       if(attempts>60){clearInterval(check);console.error("SnapTrace: face-api.js library never loaded after 18s");resolve(false)}
     },300);
   });
@@ -119,6 +129,47 @@ function tryLoadModels(modelUrl,onProgress){
   });
 }
 
+// Initialize TensorFlow.js backend (required before any face detection)
+function initTfBackend(){
+  // faceapi.tf exposes the bundled TensorFlow.js runtime
+  var tf=faceapi.tf||faceapi.TF||(typeof window!=="undefined"&&window.tf);
+  if(!tf){
+    console.warn("SnapTrace: No TF.js runtime found, skipping backend init");
+    return Promise.resolve(true);
+  }
+  var currentBackend=tf.getBackend&&tf.getBackend();
+  if(currentBackend){
+    console.log("SnapTrace: TF.js backend already set:",currentBackend);
+    return Promise.resolve(true);
+  }
+  console.log("SnapTrace: Initializing TF.js backend...");
+  // Try webgl first (GPU-accelerated), then wasm, then cpu
+  var backends=["webgl","wasm","cpu"];
+  var chain=Promise.reject(new Error("start"));
+  backends.forEach(function(name){
+    chain=chain.catch(function(){
+      console.log("SnapTrace: Trying TF.js backend:",name);
+      return tf.setBackend(name).then(function(){
+        return tf.ready();
+      }).then(function(){
+        console.log("SnapTrace: TF.js backend initialized:",tf.getBackend());
+        return true;
+      });
+    });
+  });
+  return chain.catch(function(err){
+    console.error("SnapTrace: All TF.js backends failed:",err);
+    // Try just calling ready() — some builds auto-select a backend
+    if(tf.ready){
+      return tf.ready().then(function(){
+        console.log("SnapTrace: TF.js ready with backend:",tf.getBackend&&tf.getBackend());
+        return true;
+      });
+    }
+    return false;
+  });
+}
+
 function loadFaceModels(onProgress){
   if(faceModelsLoaded)return Promise.resolve(true);
   if(faceModelsLoading)return new Promise(function(resolve){
@@ -138,8 +189,18 @@ function loadFaceModels(onProgress){
       return false;
     }
     console.log("SnapTrace: face-api.js loaded, version:",faceapi.version||"unknown");
+    console.log("SnapTrace: faceapi.tf available:",!!(faceapi.tf),", faceapi.nets available:",!!(faceapi.nets));
+    // Initialize TF.js backend BEFORE loading models
+    if(onProgress)onProgress("Initializing AI engine...");
+    return initTfBackend();
+  }).then(function(backendOk){
+    if(backendOk===false){
+      faceModelError="AI engine failed to initialize. Your browser may not support WebGL.";
+      faceModelsLoading=false;
+      return false;
+    }
     if(onProgress)onProgress("Downloading AI models...");
-    // Try each CDN URL until one works
+    // Try each model URL until one works
     var chain=Promise.reject(new Error("start"));
     FACE_MODEL_URLS.forEach(function(url){
       chain=chain.catch(function(prevErr){
@@ -153,11 +214,13 @@ function loadFaceModels(onProgress){
     faceModelsLoaded=true;
     faceModelsLoading=false;
     faceModelError=null;
-    console.log("SnapTrace: All face models loaded successfully!");
+    var tf=faceapi.tf;
+    var backendName=tf&&tf.getBackend?tf.getBackend():"unknown";
+    console.log("SnapTrace: All face models loaded successfully! Backend:",backendName);
     if(onProgress)onProgress("AI models ready!");
     return true;
   }).catch(function(err){
-    console.error("SnapTrace: Failed to load face models from all CDN sources:",err);
+    console.error("SnapTrace: Failed to load face models from all sources:",err);
     faceModelError="Could not download AI models. Please check your internet connection and try again.";
     faceModelsLoading=false;
     return false;
@@ -190,6 +253,18 @@ function loadImage(src){
 function detectFacesInImage(imgEl){
   if(!faceModelsLoaded){console.error("SnapTrace: Models not loaded, skipping detection");return Promise.resolve([]);}
   if(!imgEl||!imgEl.naturalWidth){console.error("SnapTrace: Invalid image element");return Promise.resolve([]);}
+  // Verify TF.js backend is ready
+  var tf=faceapi.tf;
+  if(tf&&tf.getBackend){
+    var backend=tf.getBackend();
+    if(!backend){
+      console.warn("SnapTrace: TF.js backend not set, attempting init...");
+      return initTfBackend().then(function(){
+        return detectFacesInImage(imgEl);
+      });
+    }
+    console.log("SnapTrace: TF.js backend:",backend);
+  }
   var w=imgEl.naturalWidth,h=imgEl.naturalHeight;
   console.log("SnapTrace: Detecting faces in",w,"x",h,"image (landmarks:",_loadedLandmarkModel+")");
   var useTiny=(_loadedLandmarkModel==="tiny");
