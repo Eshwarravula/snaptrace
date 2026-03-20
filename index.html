@@ -188,52 +188,69 @@ function loadImage(src){
 }
 
 function detectFacesInImage(imgEl){
-  if(!faceModelsLoaded){console.warn("SnapTrace: Models not loaded, skipping detection");return Promise.resolve([]);}
+  if(!faceModelsLoaded){console.error("SnapTrace: Models not loaded, skipping detection");return Promise.resolve([]);}
+  if(!imgEl||!imgEl.naturalWidth){console.error("SnapTrace: Invalid image element");return Promise.resolve([]);}
   var w=imgEl.naturalWidth,h=imgEl.naturalHeight;
   console.log("SnapTrace: Detecting faces in",w,"x",h,"image (landmarks:",_loadedLandmarkModel+")");
   var useTiny=(_loadedLandmarkModel==="tiny");
 
   function mapDetections(detections){
-    return detections.map(function(d){
-      return{
+    var mapped=[];
+    for(var i=0;i<detections.length;i++){
+      var d=detections[i];
+      if(!d.descriptor||d.descriptor.length<64){
+        console.warn("SnapTrace: Skipping face with invalid descriptor, length:",d.descriptor?d.descriptor.length:0);
+        continue;
+      }
+      mapped.push({
         descriptor:Array.from(d.descriptor),
         box:{x:d.detection.box.x,y:d.detection.box.y,w:d.detection.box.width,h:d.detection.box.height},
         score:d.detection.score
-      };
-    });
+      });
+    }
+    return mapped;
   }
 
-  // Use larger inputSize for bigger images (better accuracy on high-res photos)
-  var primarySize=w>1000||h>1000?608:416;
-  var sizes=[primarySize,512,416,320];
-  // Remove duplicates
-  sizes=sizes.filter(function(v,i,a){return a.indexOf(v)===i});
+  // Try multiple input sizes — smaller sizes detect larger faces better, larger sizes detect smaller faces
+  var sizes;
+  if(w>1200||h>1200)sizes=[608,416,320];
+  else if(w>600||h>600)sizes=[416,320,224];
+  else sizes=[320,224];
+
+  function runDetection(imgInput,size,useTinyLm){
+    var opts=new faceapi.TinyFaceDetectorOptions({inputSize:size,scoreThreshold:0.1});
+    return faceapi.detectAllFaces(imgInput,opts)
+      .withFaceLandmarks(useTinyLm)
+      .withFaceDescriptors();
+  }
 
   function tryDetect(sizeIdx){
-    var size=sizes[sizeIdx]||416;
-    var opts=new faceapi.TinyFaceDetectorOptions({inputSize:size,scoreThreshold:0.15});
-    return faceapi.detectAllFaces(imgEl,opts)
-      .withFaceLandmarks(useTiny)
-      .withFaceDescriptors()
+    if(sizeIdx>=sizes.length)return Promise.resolve([]);
+    var size=sizes[sizeIdx];
+    return runDetection(imgEl,size,useTiny)
       .then(function(detections){
-        console.log("SnapTrace: Found "+detections.length+" face(s) at inputSize="+size+" (scores: "+detections.map(function(d){return d.detection.score.toFixed(2)}).join(",")+")");
-        if(detections.length===0&&sizeIdx+1<sizes.length){
-          return tryDetect(sizeIdx+1);
+        console.log("SnapTrace: inputSize="+size+" → "+detections.length+" face(s)"+
+          (detections.length>0?" (scores: "+detections.map(function(d){return d.detection.score.toFixed(3)}).join(", ")+")":""));
+        if(detections.length>0){
+          return mapDetections(detections);
         }
-        return mapDetections(detections);
+        // Try next size
+        return tryDetect(sizeIdx+1);
       }).catch(function(err){
-        if(useTiny&&err.message&&err.message.indexOf("landmark")!==-1){
-          console.warn("SnapTrace: Tiny landmarks failed, using full model");
-          return faceapi.detectAllFaces(imgEl,opts).withFaceLandmarks(false).withFaceDescriptors()
-            .then(mapDetections);
+        console.warn("SnapTrace: Detection failed at size "+size+":",err.message);
+        // If tiny landmarks failed, try with full landmarks
+        if(useTiny&&err.message&&(err.message.indexOf("landmark")!==-1||err.message.indexOf("input")!==-1)){
+          console.log("SnapTrace: Retrying with full landmark model at size",size);
+          return runDetection(imgEl,size,false).then(function(dets){
+            if(dets.length>0)return mapDetections(dets);
+            return tryDetect(sizeIdx+1);
+          }).catch(function(){return tryDetect(sizeIdx+1)});
         }
-        if(sizeIdx+1<sizes.length)return tryDetect(sizeIdx+1);
-        throw err;
+        return tryDetect(sizeIdx+1);
       });
   }
   return tryDetect(0).catch(function(err){
-    console.error("SnapTrace: Face detection FAILED for all sizes:",err.message||err);
-    console.error("SnapTrace: Models loaded?",faceModelsLoaded,"Landmark model:",_loadedLandmarkModel);
+    console.error("SnapTrace: Face detection FAILED completely:",err.message||err);
     return[];
   });
 }
@@ -325,28 +342,45 @@ function idbDeletePhotos(eventId){
 }
 
 function euclideanDist(a,b){
+  if(!a||!b||a.length===0||b.length===0)return 999;
+  if(a.length!==b.length)return 999;
   var sum=0;
-  for(var i=0;i<a.length;i++){var d=a[i]-b[i];sum+=d*d}
-  return Math.sqrt(sum);
+  for(var i=0;i<a.length;i++){var d=(a[i]||0)-(b[i]||0);sum+=d*d}
+  var result=Math.sqrt(sum);
+  if(isNaN(result))return 999;
+  return result;
 }
 
 function matchFaces(selfieDescriptors,photoFaceData,threshold){
   if(!threshold)threshold=0.6;
-  console.log("SnapTrace matchFaces: selfieDescs="+selfieDescriptors.length+", photos="+photoFaceData.length+", threshold="+threshold);
+  // Validate inputs
+  var validSelfieDescs=selfieDescriptors.filter(function(sd){
+    return sd&&Array.isArray(sd)&&sd.length>=64;
+  });
+  if(validSelfieDescs.length===0){
+    console.error("SnapTrace matchFaces: No valid selfie descriptors! Count:",selfieDescriptors.length,
+      "Lengths:",selfieDescriptors.map(function(d){return d?d.length:0}));
+    return[];
+  }
+  console.log("SnapTrace matchFaces: selfieDescs="+validSelfieDescs.length+
+    " (dim="+validSelfieDescs[0].length+"), photos="+photoFaceData.length+", threshold="+threshold);
   var results=[];
+  var allDistances=[];
   photoFaceData.forEach(function(photo,pi){
     if(!photo.faceData||photo.faceData.length===0)return;
-    var bestDist=Infinity;
-    selfieDescriptors.forEach(function(sd){
-      if(!sd||!Array.isArray(sd)||sd.length===0)return;
-      photo.faceData.forEach(function(fd){
-        if(!fd||!fd.descriptor||!Array.isArray(fd.descriptor)||fd.descriptor.length===0)return;
-        var dist=euclideanDist(sd,fd.descriptor);
+    var bestDist=999;
+    photo.faceData.forEach(function(fd){
+      if(!fd||!fd.descriptor)return;
+      var desc=fd.descriptor;
+      if(!Array.isArray(desc)||desc.length<64)return;
+      validSelfieDescs.forEach(function(sd){
+        var dist=euclideanDist(sd,desc);
         if(dist<bestDist)bestDist=dist;
       });
     });
-    if(bestDist<2){  // Log all reasonable distances for debugging
-      console.log("SnapTrace: Photo "+(photo.name||photo.id)+" best distance: "+bestDist.toFixed(3)+(bestDist<threshold?" ✓ MATCH":""));
+    var label=(photo.name||photo.id||("photo_"+pi));
+    if(bestDist<5){
+      allDistances.push({label:label,dist:bestDist});
     }
     if(bestDist<threshold){
       var rawConf=1.0-bestDist/0.8;
@@ -354,8 +388,13 @@ function matchFaces(selfieDescriptors,photoFaceData,threshold){
       results.push({photo:photo,distance:bestDist,confidence:confidence});
     }
   });
+  // Log ALL distances sorted (helps debug threshold issues)
+  allDistances.sort(function(a,b){return a.dist-b.dist});
+  console.log("SnapTrace matchFaces results (threshold="+threshold+"): "+results.length+" matches. All distances:");
+  allDistances.forEach(function(d){
+    console.log("  "+d.label+": "+d.dist.toFixed(4)+(d.dist<threshold?" ✓ MATCH":""));
+  });
   results.sort(function(a,b){return a.distance-b.distance});
-  console.log("SnapTrace matchFaces: "+results.length+" matches found");
   return results;
 }
 
@@ -626,32 +665,60 @@ function EvtPage({event:ev,events,setEvents,nav,toast}){
     });
   }
 
+  // Resize image for face detection (max 1600px - good balance of accuracy vs performance)
+  function resizeForDetection(dataUrl,maxDim){
+    if(!maxDim)maxDim=1600;
+    return new Promise(function(resolve){
+      var img=new Image();
+      img.onload=function(){
+        var w=img.naturalWidth,h=img.naturalHeight;
+        if(w<=maxDim&&h<=maxDim){resolve(img);return}
+        var scale=Math.min(maxDim/w,maxDim/h);
+        var nw=Math.round(w*scale),nh=Math.round(h*scale);
+        console.log("SnapTrace: Resizing for detection:",w+"x"+h,"→",nw+"x"+nh);
+        var c=document.createElement("canvas");c.width=nw;c.height=nh;
+        c.getContext("2d").drawImage(img,0,0,nw,nh);
+        var resizedImg=new Image();
+        resizedImg.onload=function(){resolve(resizedImg)};
+        resizedImg.onerror=function(){resolve(img)}; // Fallback to original
+        resizedImg.src=c.toDataURL("image/jpeg",0.92);
+      };
+      img.onerror=function(){resolve(null)};
+      img.src=dataUrl;
+    });
+  }
+
   function processOneFile(file,index,total,modelsOk){
+    var photoId="ph_"+Date.now()+"_"+index+"_"+Math.random().toString(36).slice(2,8);
     setModelStatus("Reading photo "+(index+1)+" of "+total+"...");
     setProg(Math.round((index/total)*50));
     return readFileAsDataUrl(file).then(function(dataUrl){
       if(!modelsOk){
-        // No AI - just compress and store
         return compressImage(dataUrl,1400,0.82).then(function(compressedUrl){
-          return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:compressedUrl,faces:0,faceData:[],name:file.name,size:file.size};
+          return{id:photoId,url:compressedUrl,faces:0,faceData:[],name:file.name,size:file.size};
         });
       }
-      // IMPORTANT: Detect faces on FULL-RES image for accuracy, then compress for storage
       setModelStatus("Detecting faces in photo "+(index+1)+" of "+total+"...");
       setProg(Math.round((index/total)*50+25));
-      return loadImage(dataUrl).then(function(fullImg){
-        return detectFacesInImage(fullImg);
+      // Resize for detection (max 1600px), then detect, then compress for storage
+      return resizeForDetection(dataUrl,1600).then(function(detectImg){
+        if(!detectImg){
+          console.warn("SnapTrace: Could not load image for detection:",file.name);
+          return[];
+        }
+        return detectFacesInImage(detectImg);
       }).then(function(faceData){
         setProg(Math.round(((index+1)/total)*80));
         setModelStatus("Compressing photo "+(index+1)+"...");
+        console.log("SnapTrace: Photo",file.name,"→",faceData.length,"faces detected");
         return compressImage(dataUrl,1400,0.82).then(function(compressedUrl){
           setProg(Math.round(((index+1)/total)*90));
-          return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:compressedUrl,faces:faceData.length,faceData:faceData,name:file.name,size:file.size};
+          return{id:photoId,url:compressedUrl,faces:faceData.length,faceData:faceData,name:file.name,size:file.size};
         });
       }).catch(function(err){
-        console.warn("SnapTrace: Face detection failed for",file.name,err);
+        console.error("SnapTrace: Face detection failed for",file.name,":",err.message||err);
         return compressImage(dataUrl,1400,0.82).then(function(compressedUrl){
-          return{id:"ph_"+Date.now()+"_"+Math.random().toString(36).slice(2),url:compressedUrl,faces:0,faceData:[],name:file.name,size:file.size};
+          return{id:photoId,url:compressedUrl,faces:0,faceData:[],name:file.name,size:file.size};
         });
       });
     });
@@ -826,65 +893,94 @@ function Gallery({event:ev,nav,toast}){
   useEffect(function(){
     if(step!=="analyzing"||!selfie)return;
     cancelRef.current=false;
+    var cancelled=function(){return cancelRef.current};
+    console.log("SnapTrace: === SELFIE ANALYSIS START === data URL length:",selfie.length);
     setModelMsg("Loading AI face models...");
-    console.log("SnapTrace: Starting selfie analysis, selfie data URL length:",selfie.length);
 
-    loadFaceModels(function(msg){if(!cancelRef.current)setModelMsg(msg)})
+    // Step 1: Load face models
+    loadFaceModels(function(msg){if(!cancelled())setModelMsg(msg)})
     .then(function(ok){
-      if(cancelRef.current)return null;
+      if(cancelled())throw{cancelled:true};
       if(!ok){
-        // Retry once automatically
         resetFaceModels();
-        setModelMsg("Retrying AI model download...");
-        return loadFaceModels(function(msg){if(!cancelRef.current)setModelMsg(msg)}).then(function(ok2){
-          if(cancelRef.current)return null;
-          if(!ok2){
-            console.error("SnapTrace: Models failed to load after retry");
-            setModelMsg("AI models failed to load. Please check your internet connection and try again.");
-            return null;
-          }
-          return true;
+        setModelMsg("Retrying model download...");
+        return loadFaceModels(function(msg){if(!cancelled())setModelMsg(msg)});
+      }
+      return ok;
+    })
+    .then(function(ok){
+      if(cancelled())throw{cancelled:true};
+      if(!ok){
+        console.error("SnapTrace: Models failed to load after retry");
+        setModelMsg("AI models failed to load. Check your internet connection.");
+        throw{userError:true};
+      }
+      console.log("SnapTrace: Models loaded OK");
+
+      // Step 2: Load and resize selfie image
+      setModelMsg("Processing your selfie...");
+      return loadImage(selfie);
+    })
+    .then(function(img){
+      if(cancelled())throw{cancelled:true};
+      console.log("SnapTrace: Selfie loaded:",img.naturalWidth,"x",img.naturalHeight);
+
+      // Resize large selfies for reliable detection
+      var w=img.naturalWidth,h=img.naturalHeight,maxSelfie=1000;
+      if(w>maxSelfie||h>maxSelfie){
+        var scale=Math.min(maxSelfie/w,maxSelfie/h);
+        var nw=Math.round(w*scale),nh=Math.round(h*scale);
+        console.log("SnapTrace: Resizing selfie to",nw,"x",nh);
+        var c=document.createElement("canvas");c.width=nw;c.height=nh;
+        c.getContext("2d").drawImage(img,0,0,nw,nh);
+        var resizedImg=new Image();
+        return new Promise(function(resolve,reject){
+          resizedImg.onload=function(){resolve(resizedImg)};
+          resizedImg.onerror=function(){
+            console.warn("SnapTrace: Resize failed, using original");
+            resolve(img);
+          };
+          resizedImg.src=c.toDataURL("image/jpeg",0.9);
         });
       }
-      console.log("SnapTrace: Models loaded OK, proceeding to detect selfie face");
-      return true;
-    }).then(function(modelsOk){
-      if(cancelRef.current||modelsOk!==true)return null;
+      return img;
+    })
+    .then(function(imgForDetection){
+      if(cancelled())throw{cancelled:true};
+
+      // Step 3: Detect faces
       setModelMsg("Detecting your face...");
-      return loadImage(selfie).then(function(img){
-        console.log("SnapTrace: Selfie image loaded:",img.naturalWidth,"x",img.naturalHeight);
-        // Resize very large selfies to improve detection reliability
-        var w=img.naturalWidth,h=img.naturalHeight,maxSelfie=1200;
-        if(w>maxSelfie||h>maxSelfie){
-          var scale=Math.min(maxSelfie/w,maxSelfie/h);
-          var nw=Math.round(w*scale),nh=Math.round(h*scale);
-          console.log("SnapTrace: Resizing selfie from",w,"x",h,"to",nw,"x",nh);
-          var c=document.createElement("canvas");c.width=nw;c.height=nh;
-          c.getContext("2d").drawImage(img,0,0,nw,nh);
-          return loadImage(c.toDataURL("image/jpeg",0.92)).then(function(resized){
-            return detectFacesInImage(resized);
-          });
-        }
-        return detectFacesInImage(img);
-      });
+      return detectFacesInImage(imgForDetection);
     })
     .then(function(faces){
-      if(cancelRef.current||faces===null||faces===undefined)return;
+      if(cancelled())throw{cancelled:true};
       console.log("SnapTrace: Selfie detection result:",faces.length,"faces found");
-      if(faces.length===0){
-        setModelMsg("No face detected in your selfie. Try a clearer, well-lit photo.");
-        return;
+
+      if(!faces||faces.length===0){
+        setModelMsg("No face detected. Try a clearer, well-lit selfie.");
+        throw{userError:true};
       }
-      window.__snapSelfieDescriptors=faces.map(function(f){return f.descriptor});
-      window.__snapSelfieFaceCount=faces.length;
-      console.log("SnapTrace: Selfie descriptors saved, descriptor length:",faces[0].descriptor.length);
-      setModelMsg(faces.length+" face"+(faces.length>1?"s":"")+" detected! Starting match...");
-      setTimeout(function(){if(!cancelRef.current){setStep("matching");setProg(0)}},1200);
+
+      // Validate descriptors
+      var validFaces=faces.filter(function(f){return f.descriptor&&f.descriptor.length>=64});
+      if(validFaces.length===0){
+        console.error("SnapTrace: Faces detected but descriptors are invalid!");
+        setModelMsg("Face detected but could not be processed. Try a different photo.");
+        throw{userError:true};
+      }
+
+      window.__snapSelfieDescriptors=validFaces.map(function(f){return f.descriptor});
+      window.__snapSelfieFaceCount=validFaces.length;
+      console.log("SnapTrace: Selfie OK -",validFaces.length,"face(s), descriptor dim="+validFaces[0].descriptor.length);
+      setModelMsg(validFaces.length+" face"+(validFaces.length>1?"s":"")+" detected! Matching...");
+      setTimeout(function(){if(!cancelled()){setStep("matching");setProg(0)}},800);
     })
     .catch(function(err){
-      console.error("SnapTrace: Face analysis error:",err);
-      if(!cancelRef.current){
-        setModelMsg("Face detection failed: "+(err.message||err));
+      if(err&&err.cancelled)return;
+      if(err&&err.userError)return; // Message already set
+      console.error("SnapTrace: Selfie analysis error:",err);
+      if(!cancelled()){
+        setModelMsg("Failed: "+(err.message||"Unknown error. Try again."));
       }
     });
 
@@ -895,94 +991,114 @@ function Gallery({event:ev,nav,toast}){
   useEffect(function(){
     if(step!=="matching")return;
     cancelRef.current=false;
+    var cancelled=function(){return cancelRef.current};
     var selfieDescs=window.__snapSelfieDescriptors||[];
-    if(selfieDescs.length===0){setStep("pick");return}
+    if(selfieDescs.length===0){
+      console.error("SnapTrace: No selfie descriptors, going back to pick");
+      setStep("pick");return;
+    }
+    console.log("SnapTrace: === MATCHING START === selfie descriptors:",selfieDescs.length,
+      "dim:",selfieDescs[0]?selfieDescs[0].length:"none");
 
-    // Ensure photos are loaded from IndexedDB (async) before matching
-    // photos from state might not have faceData yet if loaded from localStorage fallback
-    function getPhotosWithFaceData(){
-      var current=photos.filter(function(p){return p.faceData&&p.faceData.length>0});
-      if(current.length>0)return Promise.resolve(current);
-      // Try loading from IndexedDB directly (might have faceData that localStorage dropped)
+    // Step 1: Get photos with face data, trying multiple sources
+    function loadAllPhotos(){
+      // Source 1: Current state photos
+      var statePhotos=photos.filter(function(p){return p.faceData&&p.faceData.length>0});
+      if(statePhotos.length>0){
+        console.log("SnapTrace: Found",statePhotos.length,"photos with faceData in state");
+        return Promise.resolve(statePhotos);
+      }
+      // Source 2: IndexedDB (async, might have faceData that state doesn't)
       if(ev&&ev.id){
         return idbLoadPhotos(ev.id).then(function(idbPhotos){
-          if(idbPhotos&&idbPhotos.length>0){
-            var withFace=idbPhotos.filter(function(p){return p.faceData&&p.faceData.length>0});
-            if(withFace.length>0){
-              console.log("SnapTrace: Loaded "+withFace.length+" photos with faceData from IndexedDB");
-              return withFace;
-            }
+          if(!idbPhotos||idbPhotos.length===0){
+            console.log("SnapTrace: No photos in IndexedDB either");
+            return photos; // Will fall through to on-the-fly scanning
           }
-          return photos; // Fallback to all photos (will scan on the fly)
-        }).catch(function(){return photos});
+          var withFace=idbPhotos.filter(function(p){return p.faceData&&p.faceData.length>0});
+          console.log("SnapTrace: IndexedDB has",idbPhotos.length,"photos,",withFace.length,"with faceData");
+          if(withFace.length>0)return withFace;
+          return idbPhotos; // Return all for on-the-fly scanning
+        }).catch(function(err){
+          console.warn("SnapTrace: IndexedDB load failed:",err);
+          return photos;
+        });
       }
       return Promise.resolve(photos);
     }
 
-    // Check if photos already have face descriptor data
-    var photosWithFaceData=photos.filter(function(p){return p.faceData&&p.faceData.length>0});
+    function doMatching(photosToMatch){
+      if(cancelled())return;
+      console.log("SnapTrace: Running matching against",photosToMatch.length,"photos with faceData");
+      setProg(85);setModelMsg("Comparing faces...");
 
-    function finishMatching(photosToMatch){
-      if(cancelRef.current)return;
-      setProg(85);setModelMsg("Matching your face against "+photosToMatch.length+" photos...");
-
-      // Two-pass matching: strict first (high confidence), then relaxed (catch more)
-      var strictMatched=matchFaces(selfieDescs,photosToMatch,0.52);
-      var relaxedMatched=matchFaces(selfieDescs,photosToMatch,0.65);
-
-      // Combine: strict matches always included, relaxed only if not duplicates
-      var matchedMap={};
-      strictMatched.forEach(function(m){matchedMap[m.photo.id]=m});
-      relaxedMatched.forEach(function(m){if(!matchedMap[m.photo.id])matchedMap[m.photo.id]=m});
-      var allMatched=Object.keys(matchedMap).map(function(k){return matchedMap[k]});
-      allMatched.sort(function(a,b){return a.distance-b.distance});
+      // Single pass with generous threshold - let the user decide what's relevant
+      var matched=matchFaces(selfieDescs,photosToMatch,0.65);
 
       setProg(100);
-      console.log("SnapTrace: Matching done - strict:",strictMatched.length,"relaxed:",relaxedMatched.length,"total unique:",allMatched.length);
+      console.log("SnapTrace: Matching complete:",matched.length,"matches from",photosToMatch.length,"photos");
 
       var confMap={};
-      var matchedPhotos=allMatched.map(function(m){confMap[m.photo.id]=m.confidence;return m.photo});
+      var matchedPhotos=matched.map(function(m){confMap[m.photo.id]=m.confidence;return m.photo});
       setMatchConfidences(confMap);
 
       setTimeout(function(){
-        if(cancelRef.current)return;
+        if(cancelled())return;
         if(matchedPhotos.length===0){
-          setModelMsg("No matching photos found. Try a different selfie with good lighting and your face clearly visible.");
+          setModelMsg("No matching photos found.");
           setStep("nomatch");
-          return;
+        }else{
+          setResults(matchedPhotos);setStep("done");setModelMsg("");
         }
-        setResults(matchedPhotos);setStep("done");setModelMsg("");
-      },500);
+      },400);
     }
 
-    setModelMsg("Loading photos for matching...");
-    getPhotosWithFaceData().then(function(resolvedPhotos){
-      if(cancelRef.current)return;
-      var withFace=resolvedPhotos.filter(function(p){return p.faceData&&p.faceData.length>0});
-      console.log("SnapTrace: Matching - total photos:",resolvedPhotos.length,", with faceData:",withFace.length);
+    setModelMsg("Loading photos...");
+    setProg(10);
 
-      if(withFace.length>0){
-        // Photos already have face data from upload - match directly
-        setModelMsg("Matching against "+withFace.length+" photos with face data...");
-        setProg(50);
-        finishMatching(withFace);
+    loadAllPhotos().then(function(loadedPhotos){
+      if(cancelled())return;
+      if(!loadedPhotos||loadedPhotos.length===0){
+        setModelMsg("No photos in this event yet.");
+        setStep("nomatch");
         return;
       }
 
-      // No pre-computed face data - scan photos on the fly
-      var allPhotos=resolvedPhotos.length>0?resolvedPhotos:photos;
-      setModelMsg("Scanning "+allPhotos.length+" event photos for faces...");
+      var withFace=loadedPhotos.filter(function(p){
+        return p.faceData&&p.faceData.length>0&&
+          p.faceData.some(function(fd){return fd.descriptor&&fd.descriptor.length>=64});
+      });
+
+      console.log("SnapTrace: Total photos:",loadedPhotos.length,", with valid faceData:",withFace.length);
+
+      if(withFace.length>0){
+        setModelMsg("Matching against "+withFace.length+" photos...");
+        setProg(50);
+        doMatching(withFace);
+        return;
+      }
+
+      // No pre-computed face data — scan photos on the fly
+      console.log("SnapTrace: No photos have faceData, scanning on the fly...");
+      var allPhotos=loadedPhotos.filter(function(p){return p.url&&p.url.length>10});
+      if(allPhotos.length===0){
+        setModelMsg("No photos available to scan.");
+        setStep("nomatch");
+        return;
+      }
+
+      setModelMsg("Scanning "+allPhotos.length+" photos for faces...");
       var scannedResults=[];
       var scanChain=Promise.resolve();
       allPhotos.forEach(function(photo,i){
         scanChain=scanChain.then(function(){
-          if(cancelRef.current)return;
-          setProg(Math.round((i/allPhotos.length)*75));
-          setModelMsg("Scanning photo "+(i+1)+" of "+allPhotos.length+" for faces...");
+          if(cancelled())return;
+          setProg(Math.round(10+(i/allPhotos.length)*65));
+          setModelMsg("Scanning photo "+(i+1)+" of "+allPhotos.length+"...");
           return loadImage(photo.url).then(function(img){
             return detectFacesInImage(img);
           }).then(function(faces){
-            if(faces.length>0){
+            if(faces&&faces.length>0){
               scannedResults.push(Object.assign({},photo,{faceData:faces,faces:faces.length}));
             }
           }).catch(function(err){
@@ -990,17 +1106,22 @@ function Gallery({event:ev,nav,toast}){
           });
         });
       });
-      scanChain.then(function(){
-        if(cancelRef.current)return;
-        console.log("SnapTrace: Scanned "+allPhotos.length+" photos, found faces in "+scannedResults.length);
-        finishMatching(scannedResults);
-      }).catch(function(err){
-        console.error("SnapTrace: Matching error:",err);
-        if(!cancelRef.current){
-          setModelMsg("Error during matching: "+err.message);
-          setTimeout(function(){setStep("pick");setSelfie(null)},3000);
+      return scanChain.then(function(){
+        if(cancelled())return;
+        console.log("SnapTrace: Scanned all photos, found faces in "+scannedResults.length+"/"+allPhotos.length);
+        if(scannedResults.length===0){
+          setModelMsg("No faces detected in any photos.");
+          setStep("nomatch");
+          return;
         }
+        doMatching(scannedResults);
       });
+    }).catch(function(err){
+      console.error("SnapTrace: Matching pipeline error:",err);
+      if(!cancelled()){
+        setModelMsg("Matching failed: "+(err.message||"Unknown error"));
+        setStep("nomatch");
+      }
     });
 
     return function(){cancelRef.current=true};
@@ -1067,12 +1188,12 @@ function Gallery({event:ev,nav,toast}){
         <div style={{width:200,height:200,borderRadius:20,overflow:"hidden",margin:"0 auto 16px",position:"relative",border:"3px solid "+C.gold}}>
           <img src={selfie} alt="" style={{width:"100%",height:"100%",objectFit:"cover"}}/>
         </div>
-        {modelMsg&&(modelMsg.indexOf("failed")!==-1||modelMsg.indexOf("No face")!==-1||modelMsg.indexOf("Failed")!==-1)?
+        {modelMsg&&(modelMsg.indexOf("failed")!==-1||modelMsg.indexOf("Failed")!==-1||modelMsg.indexOf("No face")!==-1||modelMsg.indexOf("not be processed")!==-1||modelMsg.indexOf("Check your")!==-1)?
           <div>
-            <p style={{color:C.rose,fontSize:14,fontWeight:600,marginBottom:12}}>{modelMsg}</p>
-            <div style={{display:"flex",gap:10,justifyContent:"center"}}>
-              <Btn size="sm" onClick={function(){setStep("pick");setSelfie(null)}}>Try Different Photo</Btn>
-              <Btn size="sm" variant="secondary" onClick={function(){resetFaceModels();setSelfie(null);setTimeout(function(){setStep("pick")},50)}}>Retry</Btn>
+            <p style={{color:C.rose,fontSize:14,fontWeight:600,marginBottom:16,lineHeight:1.5}}>{modelMsg}</p>
+            <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
+              <Btn size="sm" onClick={function(){setSelfie(null);setStep("pick");setModelMsg("")}} icon={<Ic.Cam/>}>Try Different Photo</Btn>
+              <Btn size="sm" variant="secondary" onClick={function(){resetFaceModels();setModelMsg("");setSelfie(null);setTimeout(function(){setStep("pick")},50)}}>Retry</Btn>
             </div>
           </div>
           :<div>
