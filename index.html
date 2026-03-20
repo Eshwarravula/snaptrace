@@ -93,29 +93,31 @@ function testModelUrl(url){
     });
 }
 
+// Track which landmark model was actually loaded
+var _loadedLandmarkModel="none";
+
 function tryLoadModels(modelUrl,onProgress){
   console.log("SnapTrace: Trying model URL:",modelUrl);
   if(onProgress)onProgress("Loading face detection model...");
-  // Detect which landmark model is available (vladmandic has both, original only has tiny in weights/)
-  var landmarkNet=faceapi.nets.faceLandmark68TinyNet||faceapi.nets.faceLandmark68Net;
-  var useTinyLandmarks=!!faceapi.nets.faceLandmark68TinyNet;
   return faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl).then(function(){
     console.log("SnapTrace: TinyFaceDetector loaded from",modelUrl);
     if(onProgress)onProgress("Loading face landmark model...");
-    // Try tiny landmarks first (smaller, faster), fall back to full
-    if(useTinyLandmarks){
-      return faceapi.nets.faceLandmark68TinyNet.loadFromUri(modelUrl).catch(function(){
-        console.log("SnapTrace: Tiny landmarks not available, trying full model");
-        return faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl);
+    // Try tiny landmarks first (smaller download), fall back to full
+    return faceapi.nets.faceLandmark68TinyNet.loadFromUri(modelUrl).then(function(){
+      _loadedLandmarkModel="tiny";
+      console.log("SnapTrace: Tiny landmark model loaded");
+    }).catch(function(e){
+      console.log("SnapTrace: Tiny landmarks failed ("+e.message+"), trying full model");
+      return faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl).then(function(){
+        _loadedLandmarkModel="full";
+        console.log("SnapTrace: Full landmark model loaded");
       });
-    }
-    return faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl);
+    });
   }).then(function(){
-    console.log("SnapTrace: Landmark model loaded");
     if(onProgress)onProgress("Loading face recognition model (6MB)...");
     return faceapi.nets.faceRecognitionNet.loadFromUri(modelUrl);
   }).then(function(){
-    console.log("SnapTrace: All models loaded from",modelUrl);
+    console.log("SnapTrace: All models loaded from",modelUrl,"(landmarks:",_loadedLandmarkModel+")");
     return true;
   });
 }
@@ -190,21 +192,20 @@ function loadImage(src){
 
 function detectFacesInImage(imgEl){
   if(!faceModelsLoaded){console.warn("SnapTrace: Models not loaded, skipping detection");return Promise.resolve([]);}
-  console.log("SnapTrace: Running face detection on",imgEl.naturalWidth,"x",imgEl.naturalHeight,"image...");
+  console.log("SnapTrace: Running face detection on",imgEl.naturalWidth,"x",imgEl.naturalHeight,"image (landmarks:",_loadedLandmarkModel+")");
+  var useTiny=(_loadedLandmarkModel==="tiny");
   // Try multiple input sizes if detection fails with first
   var inputSizes=[416,512,320];
   function tryDetect(sizeIdx){
     var size=inputSizes[sizeIdx]||416;
     var opts=new faceapi.TinyFaceDetectorOptions({inputSize:size,scoreThreshold:0.15});
-    // Use tiny landmarks if available (loaded), otherwise full landmarks
-    var useTiny=faceapi.nets.faceLandmark68TinyNet&&faceapi.nets.faceLandmark68TinyNet.isLoaded?true:false;
     return faceapi.detectAllFaces(imgEl,opts)
       .withFaceLandmarks(useTiny)
       .withFaceDescriptors()
       .then(function(detections){
         console.log("SnapTrace: Found "+detections.length+" face(s) at inputSize="+size);
         if(detections.length===0&&sizeIdx+1<inputSizes.length){
-          console.log("SnapTrace: No faces found, trying inputSize="+inputSizes[sizeIdx+1]);
+          console.log("SnapTrace: Retrying with inputSize="+inputSizes[sizeIdx+1]);
           return tryDetect(sizeIdx+1);
         }
         return detections.map(function(d){
@@ -214,6 +215,14 @@ function detectFacesInImage(imgEl){
             score:d.detection.score
           };
         });
+      }).catch(function(err){
+        // If landmark type fails, try the other one
+        if(useTiny&&err.message&&err.message.indexOf("landmark")!==-1){
+          console.warn("SnapTrace: Tiny landmarks failed, retrying with full at size",size);
+          return faceapi.detectAllFaces(imgEl,opts).withFaceLandmarks(false).withFaceDescriptors()
+            .then(function(detections){return detections.map(function(d){return{descriptor:Array.from(d.descriptor),box:{x:d.detection.box.x,y:d.detection.box.y,w:d.detection.box.width,h:d.detection.box.height},score:d.detection.score}})});
+        }
+        throw err;
       });
   }
   return tryDetect(0).catch(function(err){
