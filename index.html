@@ -11,37 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
-<!-- Firebase SDK (modular compat) -->
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-storage-compat.js"></script>
-<script>
-// ══════════════════════════════════════════════════════════════
-// FIREBASE CONFIG — Replace with your own Firebase project config
-// Go to https://console.firebase.google.com → Create project →
-// Project Settings → Your apps → Web app → Copy config
-// ══════════════════════════════════════════════════════════════
-var FIREBASE_CONFIG={
-  apiKey:"AIzaSyDummyKeyReplaceMeXxxxxxxxxxx",
-  authDomain:"your-project.firebaseapp.com",
-  projectId:"your-project",
-  storageBucket:"your-project.firebasestorage.app",
-  messagingSenderId:"000000000000",
-  appId:"1:000000000000:web:xxxxxxxxxxxxxxxxxxxx"
-};
-var _fbApp=null,_fbDb=null,_fbStorage=null,_fbReady=false;
-try{
-  if(FIREBASE_CONFIG.projectId!=="your-project"){
-    _fbApp=firebase.initializeApp(FIREBASE_CONFIG);
-    _fbDb=firebase.firestore();
-    _fbStorage=firebase.storage();
-    _fbReady=true;
-    console.log("SnapTrace: Firebase initialized for project:",FIREBASE_CONFIG.projectId);
-  }else{
-    console.warn("SnapTrace: Firebase not configured — using local storage only. Photos won't be visible to guests.");
-  }
-}catch(e){console.error("SnapTrace: Firebase init failed:",e)}
-</script>
+<!-- Cloud storage via Vercel Blob API -->
 <!-- face-api.js: local file first, CDN fallback -->
 <script>
 (function(){
@@ -453,107 +423,68 @@ function idbDeletePhotos(eventId){
   }).catch(function(){});
 }
 
-// ── Firebase Cloud Storage ──
-// Stores photos in Firebase Storage and metadata in Firestore
-// so guests on different devices can see uploaded photos
+// ── Cloud Storage via Vercel Blob API ──
+// Stores photos and event data in Vercel Blob Storage
+// so guests on any device can see uploaded photos
 
-function fbSaveEvent(event){
-  if(!_fbReady||!_fbDb)return Promise.resolve(false);
-  var doc={
-    id:event.id,
-    name:event.name,
-    date:event.date,
-    qrCode:event.qrCode,
-    createdAt:event.createdAt||new Date().toISOString(),
-    photoCount:event.photos?event.photos.length:0
-  };
-  return _fbDb.collection("events").doc(event.id).set(doc,{merge:true})
-    .then(function(){console.log("SnapTrace: Event saved to Firestore:",event.id);return true})
-    .catch(function(err){console.warn("SnapTrace: Firestore event save failed:",err);return false});
-}
+var _apiBase=location.origin;
 
-function fbSavePhoto(eventId,photo){
-  if(!_fbReady||!_fbStorage||!_fbDb)return Promise.resolve(null);
-  if(!photo.url||photo.url.length<10)return Promise.resolve(null);
-  // Convert data URL to blob for Firebase Storage
-  var parts=photo.url.split(",");
-  if(parts.length<2)return Promise.resolve(null);
-  var mime=(parts[0].match(/:(.*?);/)||[])[1]||"image/jpeg";
-  var byteStr;
-  try{byteStr=atob(parts[1])}catch(e){return Promise.resolve(null)}
-  var ab=new ArrayBuffer(byteStr.length);
-  var ia=new Uint8Array(ab);
-  for(var i=0;i<byteStr.length;i++)ia[i]=byteStr.charCodeAt(i);
-  var blob=new Blob([ab],{type:mime});
-  var path="photos/"+eventId+"/"+photo.id+".jpg";
-  var ref=_fbStorage.ref(path);
-  return ref.put(blob).then(function(snap){
-    return snap.ref.getDownloadURL();
-  }).then(function(downloadUrl){
-    // Save photo metadata (with download URL and face descriptors) to Firestore
-    var meta={
-      id:photo.id,
-      url:downloadUrl,
-      faces:photo.faces||0,
-      faceData:photo.faceData?JSON.stringify(photo.faceData):"[]",
-      name:photo.name||"",
-      size:photo.size||0,
-      uploadedAt:new Date().toISOString()
-    };
-    return _fbDb.collection("events").doc(eventId).collection("photos").doc(photo.id).set(meta);
-  }).then(function(){
-    console.log("SnapTrace: Photo saved to Firebase:",photo.id);
+function cloudSaveEvent(event){
+  return fetch(_apiBase+"/api/save-event",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      id:event.id,name:event.name,date:event.date,
+      qrCode:event.qrCode,createdAt:event.createdAt||new Date().toISOString(),
+      photoCount:event.photos?event.photos.length:0
+    })
+  }).then(function(r){
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    console.log("SnapTrace: Event saved to cloud:",event.id);
     return true;
   }).catch(function(err){
-    console.warn("SnapTrace: Firebase photo save failed:",err);
+    console.warn("SnapTrace: Cloud event save failed:",err.message);
     return false;
   });
 }
 
-function fbLoadEventByQr(qrCode){
-  if(!_fbReady||!_fbDb)return Promise.resolve(null);
-  return _fbDb.collection("events").where("qrCode","==",qrCode).limit(1).get()
-    .then(function(snap){
-      if(snap.empty){console.log("SnapTrace: No event found in Firebase for QR:",qrCode);return null}
-      var evDoc=snap.docs[0].data();
-      // Load photos for this event
-      return _fbDb.collection("events").doc(evDoc.id).collection("photos")
-        .orderBy("uploadedAt","desc").get().then(function(photoSnap){
-          var photos=[];
-          photoSnap.forEach(function(doc){
-            var p=doc.data();
-            var faceData=[];
-            try{faceData=JSON.parse(p.faceData||"[]")}catch(e){}
-            photos.push({id:p.id,url:p.url,faces:p.faces||0,faceData:faceData,name:p.name||"",size:p.size||0});
-          });
-          console.log("SnapTrace: Loaded",photos.length,"photos from Firebase for event:",evDoc.name);
-          return Object.assign({},evDoc,{photos:photos});
-        });
-    }).catch(function(err){
-      console.warn("SnapTrace: Firebase event load failed:",err);
-      return null;
-    });
+function cloudSavePhoto(eventId,photo){
+  if(!photo.url||photo.url.length<10)return Promise.resolve(null);
+  return fetch(_apiBase+"/api/save-photo",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({eventId:eventId,photo:{
+      id:photo.id,url:photo.url,faces:photo.faces||0,
+      faceData:photo.faceData||[],name:photo.name||"",size:photo.size||0
+    }})
+  }).then(function(r){
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(data){
+    console.log("SnapTrace: Photo saved to cloud:",photo.id);
+    return data;
+  }).catch(function(err){
+    console.warn("SnapTrace: Cloud photo save failed:",err.message);
+    return null;
+  });
 }
 
-function fbLoadEventById(eventId){
-  if(!_fbReady||!_fbDb)return Promise.resolve(null);
-  return _fbDb.collection("events").doc(eventId).get()
-    .then(function(doc){
-      if(!doc.exists)return null;
-      var evDoc=doc.data();
-      return _fbDb.collection("events").doc(eventId).collection("photos")
-        .orderBy("uploadedAt","desc").get().then(function(photoSnap){
-          var photos=[];
-          photoSnap.forEach(function(d){
-            var p=d.data();
-            var faceData=[];
-            try{faceData=JSON.parse(p.faceData||"[]")}catch(e){}
-            photos.push({id:p.id,url:p.url,faces:p.faces||0,faceData:faceData,name:p.name||"",size:p.size||0});
-          });
-          return Object.assign({},evDoc,{photos:photos});
-        });
+function cloudLoadEventByQr(qrCode){
+  return fetch(_apiBase+"/api/get-event?qr="+encodeURIComponent(qrCode))
+    .then(function(r){
+      if(!r.ok){
+        if(r.status===404)return null;
+        throw new Error("HTTP "+r.status);
+      }
+      return r.json();
+    }).then(function(data){
+      if(!data||!data.event)return null;
+      var ev=data.event;
+      ev.photos=data.photos||[];
+      console.log("SnapTrace: Loaded",ev.photos.length,"photos from cloud for event:",ev.name);
+      return ev;
     }).catch(function(err){
-      console.warn("SnapTrace: Firebase event load by ID failed:",err);
+      console.warn("SnapTrace: Cloud event load failed:",err.message);
       return null;
     });
 }
@@ -819,7 +750,7 @@ function Dash({user,setUser,nav,logout,events,setEvents,toast}){
   const create=()=>{if(!en||!ed)return;if(!canCreate){setShowPay(true);return}
     const ev={id:`evt_${Date.now()}`,name:en,date:ed,qrCode:`${Date.now().toString(36)}${Math.random().toString(36).slice(2,5)}`,photos:[],createdAt:new Date().toISOString(),isTrial:user.subscription.status==="trial"};
     setEvents(p=>[...p,ev]);setUser(u=>({...u,subscription:{...u.subscription,eventsUsed:u.subscription.eventsUsed+1}}));setEn("");setEd("");setShowCreate(false);
-    fbSaveEvent(ev);toast("Event created!","success")};
+    cloudSaveEvent(ev);toast("Event created!","success")};
 
   return <div style={{minHeight:"100vh",background:C.cream}}>
     <header style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px clamp(16px,3vw,32px)",background:C.white+"E0",backdropFilter:"blur(16px)",borderBottom:`1px solid ${C.creamDk}`,position:"sticky",top:0,zIndex:100}}>
@@ -974,9 +905,9 @@ function EvtPage({event:ev,events,setEvents,nav,toast}){
                 if(evt.id===ev.id){return Object.assign({},evt,{photos:evt.photos.concat([photo])})}
                 return evt;
               })});
-              // Save photo to Firebase in background (for guest access)
-              fbSavePhoto(ev.id,photo).catch(function(e){
-                console.warn("SnapTrace: Firebase upload failed for",photo.name||photo.id,e);
+              // Save photo to cloud in background (for guest access)
+              cloudSavePhoto(ev.id,photo).catch(function(e){
+                console.warn("SnapTrace: Cloud upload failed for",photo.name||photo.id,e);
               });
             }
           }).catch(function(err){
@@ -1072,29 +1003,29 @@ function Gallery({event:ev,aQr,nav,toast}){
   const camRef=useRef(null);
   const upRef=useRef(null);
 
-  // Load photos: Firebase (cloud) → IndexedDB → localStorage → demo
+  // Load photos: Cloud → IndexedDB → localStorage → demo
   const[livePhotos,setLivePhotos]=useState(ev?ev.photos:[]);
-  const[fbEvent,setFbEvent]=useState(null);
+  const[cloudEvent,setCloudEvent]=useState(null);
   const[loading,setLoading]=useState(true);
   useEffect(function(){
     if(!ev&&!aQr){setLoading(false);return}
     // Initialize with whatever we have locally
     if(ev&&ev.photos&&ev.photos.length>0){setLivePhotos(ev.photos)}
 
-    // Try Firebase first (this is how guests get photos)
+    // Try cloud first (this is how guests get photos)
     var qr=ev?ev.qrCode:aQr;
-    function loadFromFirebase(){
+    function loadFromCloud(){
       if(!qr)return Promise.resolve(null);
-      return fbLoadEventByQr(qr).then(function(fbEvt){
-        if(fbEvt&&fbEvt.photos&&fbEvt.photos.length>0){
-          console.log("SnapTrace Gallery: Loaded",fbEvt.photos.length,"photos from Firebase");
-          setLivePhotos(fbEvt.photos);
-          setFbEvent(fbEvt);
-          return fbEvt;
+      return cloudLoadEventByQr(qr).then(function(cloudEvt){
+        if(cloudEvt&&cloudEvt.photos&&cloudEvt.photos.length>0){
+          console.log("SnapTrace Gallery: Loaded",cloudEvt.photos.length,"photos from cloud");
+          setLivePhotos(cloudEvt.photos);
+          setCloudEvent(cloudEvt);
+          return cloudEvt;
         }
         return null;
       }).catch(function(err){
-        console.warn("SnapTrace Gallery: Firebase load failed:",err);
+        console.warn("SnapTrace Gallery: Cloud load failed:",err);
         return null;
       });
     }
@@ -1108,9 +1039,9 @@ function Gallery({event:ev,aQr,nav,toast}){
       }).catch(function(){});
     }
 
-    // Load from Firebase first, then local as supplement
+    // Load from cloud first, then local as supplement
     setLoading(true);
-    loadFromFirebase().then(function(fbEvt){
+    loadFromCloud().then(function(cloudEvt){
       loadLocal();
       setLoading(false);
     }).catch(function(){
@@ -1118,8 +1049,8 @@ function Gallery({event:ev,aQr,nav,toast}){
       setLoading(false);
     });
 
-    // Poll Firebase every 10s for new uploads, local every 3s
-    var fbTimer=setInterval(function(){loadFromFirebase()},10000);
+    // Poll cloud every 10s for new uploads, local every 3s
+    var fbTimer=setInterval(function(){loadFromCloud()},10000);
     var localTimer=setInterval(loadLocal,3000);
     function onStorage(e){if(e.key==="st_events")loadLocal()}
     window.addEventListener("storage",onStorage);
@@ -1127,7 +1058,7 @@ function Gallery({event:ev,aQr,nav,toast}){
   },[ev,aQr]);
 
   var photos=livePhotos.length>0?livePhotos:(ev?ev.photos:PHOTOS);
-  var eName=fbEvent?fbEvent.name:(ev?ev.name:"Priya & Arjun's Wedding");
+  var eName=cloudEvent?cloudEvent.name:(ev?ev.name:"Priya & Arjun's Wedding");
 
   function onFile(e){
     var f=e.target.files&&e.target.files[0];
@@ -1524,8 +1455,8 @@ function saveEvents(events){
     // Store full photos (with faceData) in IndexedDB (large capacity) — PRIMARY local storage
     events.forEach(function(e){
       idbSavePhotos(e.id,e.photos).catch(function(){});
-      // Save event + photos to Firebase (cloud — for guest access)
-      fbSaveEvent(e);
+      // Save event to cloud (for guest access)
+      cloudSaveEvent(e);
       // localStorage backup: try full data, fallback to stripped if quota exceeded
       try{
         localStorage.setItem("st_photos_"+e.id,JSON.stringify(e.photos));
