@@ -1,4 +1,8 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-html{scroll-behavior:smooth}body{background:#fff;color:#10201a}input,select,textarea{font-size:16px}.card{@apply rounded-3xl border border-slate-200 bg-white shadow-sm}.badge{@apply inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold}
+
+html { scroll-behavior: smooth; }
+body { background: #f8fafc; color: #020617; }
+input, select, textarea { font-size: 16px; }
+button, a { transition: all 160ms ease; }
